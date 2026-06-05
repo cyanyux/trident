@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The App Sandbox must be OFF: Trident links the private MultitouchSupport
+	     framework and synthesizes system-wide events, neither of which a sandboxed
+	     app can do. Accessibility is granted at runtime (AXIsProcessTrusted), not
+	     via an entitlement. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

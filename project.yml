@@ -1,0 +1,80 @@
+name: Trident
+
+options:
+  bundleIdPrefix: com.trident
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    # Ad-hoc signing for local development. Signing must be ALLOWED (not just
+    # "-") — a linker-signed stub won't be honored by Accessibility/TCC. For
+    # distribution, switch to a Developer ID identity and add hardened runtime +
+    # library-validation opt-out.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "YES"
+
+targets:
+  # UI-free gesture pipeline. Static library: the app does the final link, so the
+  # private-framework flag lives on the app target (and the test target).
+  TridentCore:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/TridentCore
+    settings:
+      base:
+        FRAMEWORK_SEARCH_PATHS: /System/Library/PrivateFrameworks
+
+  # Menu-bar accessory app.
+  Trident:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/TridentApp
+    dependencies:
+      - target: TridentCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.trident.Trident
+        INFOPLIST_FILE: Sources/TridentApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/TridentApp/Trident.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        FRAMEWORK_SEARCH_PATHS: /System/Library/PrivateFrameworks
+        OTHER_LDFLAGS: -F/System/Library/PrivateFrameworks -framework MultitouchSupport
+        ENABLE_HARDENED_RUNTIME: "NO"
+
+  # Logic tests for TridentCore (no host app). Links the private framework so the
+  # MultitouchSupport symbols referenced by DeviceMonitor resolve.
+  TridentCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/TridentCoreTests
+    dependencies:
+      - target: TridentCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        FRAMEWORK_SEARCH_PATHS: /System/Library/PrivateFrameworks
+        OTHER_LDFLAGS: -F/System/Library/PrivateFrameworks -framework MultitouchSupport
+
+schemes:
+  Trident:
+    build:
+      targets:
+        Trident: all
+    run:
+      config: Debug
+  TridentCoreTests:
+    build:
+      targets:
+        TridentCoreTests: all
+    test:
+      targets:
+        - TridentCoreTests
