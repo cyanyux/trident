@@ -33,8 +33,10 @@ private let contactCallback: MTContactCallbackFunction = { device, touches, numT
         let ptr = touches.assumingMemoryBound(to: MTTouch.self)
         handler(ptr, Int(numTouches), timestamp, size.widthMM, size.heightMM)
     }
-    // Never consume — Trident only generates events; it lets the system see the
-    // raw gesture so other trackpad behaviors keep working.
+    // Never consume — the framework ignores this return value for gesture/cursor
+    // suppression (verified: returning non-zero doesn't stop the system moving the cursor),
+    // and Trident only generates events; letting the system see the raw frames keeps other
+    // trackpad behaviors working.
     return 0
 }
 

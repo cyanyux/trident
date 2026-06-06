@@ -99,11 +99,27 @@ final class GestureRecognizerTests: XCTestCase {
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
 
-    func testSwipeLeftEmitsBackward() {
+    /// A quick left flick (lifted before the HUD) switches to the *previous* app, not
+    /// the oldest one: the first step always opens forward (⌘Tab), like tapping ⌘Tab.
+    /// Direction only governs scrubbing once the HUD is up (next test).
+    func testQuickLeftFlickSwitchesToPreviousApp() {
         feed(threeFingers(centerX: 0.60), at: 0.00)
         feed(threeFingers(centerX: 0.44), at: 0.02)  // crosses threshold leftward
         feed([], at: 0.06)
-        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.backward), .swipeCommit])
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// Held past the HUD reveal, a leftward sweep scrubs *backward* (⌘⇧Tab): the first
+    /// step opens forward, then each further leftward threshold steps back.
+    func testLeftScrubWithHUDStepsBackward() {
+        feed(threeFingers(centerX: 0.70), at: 0.00)
+        feed(threeFingers(centerX: 0.54), at: 0.02)  // begin + first step (opens forward)
+        feed(threeFingers(centerX: 0.38), at: 0.35)  // HUD up → backward
+        feed(threeFingers(centerX: 0.22), at: 0.70)  // backward
+        feed([], at: 0.75)
+        XCTAssertEqual(actions, [
+            .swipeBegin, .swipeStep(.forward), .swipeStep(.backward), .swipeStep(.backward), .swipeCommit,
+        ])
     }
 
     /// A fast flick crosses several thresholds before the system app-switcher HUD can
@@ -154,6 +170,63 @@ final class GestureRecognizerTests: XCTestCase {
         feed([contact(0.2, 0.5), contact(0.4, 0.5), contact(0.6, 0.5), contact(0.8, 0.5)], at: 0.02)
         feed([], at: 0.04)
         XCTAssertEqual(actions, [])
+    }
+
+    /// A stalled touch stream (sleep, disconnect, Bluetooth drop) that resumes mid-swipe
+    /// is abandoned, not continued: the recognizer emits `.cancel` — releasing ⌘ even if
+    /// the synthesizer's watchdog hasn't yet — and returns to idle, so the resuming
+    /// fingers start a fresh gesture instead of stepping a switcher that's already gone.
+    func testStalledStreamAbandonsInFlightSwipe() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)  // swipeBegin + forward step
+        feed(threeFingers(centerX: 0.62), at: 2.50)  // >2 s gap → abandon (.cancel), re-arm fresh
+        feed([], at: 2.54)                            // fresh tracking, single frame → no tap
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .cancel])
+    }
+
+    /// A frame gap of *exactly* `staleStreamGap` is not a stall (the check is strict
+    /// `>`), so the gesture continues rather than being abandoned — guards the boundary.
+    func testFrameGapAtStaleThresholdDoesNotAbandon() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + forward; lastTimestamp = 0.02
+        feed(threeFingers(centerX: 0.62), at: 2.02)   // gap == 2.0 (not > 2.0) → continues; HUD up → step
+        feed([], at: 2.05)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// A threshold crossing landing *exactly* at the HUD-reveal delay steps (the check is
+    /// `>=`), not swallowed — guards the boundary between the pre-HUD single switch and
+    /// post-HUD scrubbing.
+    func testStepAtHUDRevealBoundaryEmits() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + forward; swipeStartTime = 0.02
+        feed(threeFingers(centerX: 0.62), at: 0.27)   // 0.27 - 0.02 == 0.25 == hudRevealDelay → steps
+        feed([], at: 0.30)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// Only three fingers drive the switch. Dropping to two fingers mid-swipe must NOT
+    /// keep stepping (that would switch on two fingers and fight the native two-finger
+    /// swipe); after the short debounce the gesture just commits.
+    func testTwoFingersDoNotStep() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)                  // begin + first step
+        feed([contact(0.50, 0.5), contact(0.56, 0.5)], at: 0.04)    // 2 fingers, moving — no step
+        feed([contact(0.66, 0.5), contact(0.72, 0.5)], at: 0.06)    // 2 fingers, moving — no step
+        feed([contact(0.82, 0.5), contact(0.88, 0.5)], at: 0.08)    // 2 fingers persist → commit
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// A one-frame contact dropout mid-scrub is absorbed (debounced): the swipe neither
+    /// commits early nor steps on the dip, and resumes stepping once three fingers return.
+    func testTransientFingerDipDoesNotCommit() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + first step
+        feed([contact(0.50, 0.5)], at: 0.04)          // 1-frame dropout to one contact — absorbed
+        feed(threeFingers(centerX: 0.62), at: 0.40)   // three back, HUD up → re-anchor, no phantom step
+        feed(threeFingers(centerX: 0.80), at: 0.42)   // real travel → one more step
+        feed([], at: 0.45)                            // lift → commit
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
     }
 
     // MARK: - Suppression lifecycle

@@ -26,12 +26,19 @@ public final class TridentEngine: @unchecked Sendable {
     public init() {
         // Recognizer emits intents; synthesizer turns them into events. Both
         // closures are set once here, before any frame can arrive.
-        recognizer.onAction = { [synthesizer, weak self] action in
+        recognizer.onAction = { [synthesizer, suppressor, weak self] action in
             synthesizer.handle(action)
             switch action {
-            case .middleClick: self?.onActionPerformed?(.middleClick)
-            case .swipeStep: self?.onActionPerformed?(.appSwitchStep)
-            default: break
+            case .middleClick:
+                self?.onActionPerformed?(.middleClick)
+            case .swipeBegin:
+                // Freeze the cursor for the duration of the switch so the swipe can't
+                // nudge it onto the ⌘Tab HUD, whose hover would hijack the selection.
+                suppressor.setCursorFreeze(true)
+            case .swipeStep:
+                self?.onActionPerformed?(.appSwitchStep)
+            case .swipeCommit, .cancel:
+                suppressor.setCursorFreeze(false)
             }
         }
         // While three fingers are down (and briefly after), block the native
@@ -39,10 +46,11 @@ public final class TridentEngine: @unchecked Sendable {
         recognizer.onGestureActiveChanged = { [suppressor] active in
             suppressor.setGestureActive(active)
         }
-        monitor.onTouches = { [recognizer, synthesizer] touches, count, timestamp, widthMM, heightMM in
-            // Heartbeat for the synthesizer's stuck-⌘ watchdog: a held modifier is only
-            // safe while frames keep arriving.
+        monitor.onTouches = { [recognizer, synthesizer, suppressor] touches, count, timestamp, widthMM, heightMM in
+            // Heartbeat for the synthesizer's stuck-⌘ watchdog and the suppressor's
+            // stuck-suppression self-heal: held state is only safe while frames arrive.
             synthesizer.noteFrame()
+            suppressor.noteFrame()
             recognizer.process(touches, count: count, timestamp: timestamp,
                                widthMM: widthMM, heightMM: heightMM)
         }

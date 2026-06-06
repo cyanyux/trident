@@ -10,6 +10,12 @@ import os
 public enum GestureTuning {
     /// Horizontal travel (mm) required per app-switch step.
     public static let swipeDistanceDefaultMM: Float = 3.5
+    /// Frame-gap (seconds) beyond which the touch stream is treated as stalled — the
+    /// device slept, disconnected, or a Bluetooth trackpad dropped — rather than a
+    /// gesture continuing. One source of truth shared by the recognizer (abandons an
+    /// in-flight gesture), the synthesizer's stuck-⌘ watchdog, and the suppressor's
+    /// stuck-suppression self-heal, so all three agree on what "stalled" means.
+    public static let staleStreamGap: Double = 2.0
     /// Ignored edge band (mm in from the rim) at gesture start.
     public static let palmEdgeBandDefaultMM: Float = 7
     /// Upper bound of the palm edge band, used to normalize the size-cap derivation.
@@ -66,6 +72,12 @@ final class GestureRecognizer: @unchecked Sendable {
     private let entryDominance: Float = 1.5   // |Δx| must beat |Δy| by this to start a swipe
     private let stepDominance: Float = 1.0    // looser once a swipe is underway
 
+    /// While swiping, only three fingers drive the switch. A contact count below three
+    /// must persist this many frames before the swipe commits — absorbing a one- or
+    /// two-frame dropout (a fingertip flickering below the contact threshold) so a glitch
+    /// doesn't cut a scrub short. A clean lift to zero contacts commits immediately.
+    private let endDebounceFrames: Int = 3
+
     /// While a swipe is underway but the system app-switcher HUD has not yet been
     /// drawn, only the initial switch is allowed — extra step thresholds crossed in
     /// this window are swallowed. A fast flick-and-lift therefore switches exactly one
@@ -77,6 +89,13 @@ final class GestureRecognizer: @unchecked Sendable {
     /// doesn't flash the overlay. Erring slightly long is the safe direction here —
     /// it favours one clean switch over a blind second step. Retune if that shifts.
     private let hudRevealDelay: Double = 0.25
+
+    /// On the first frame after a stalled stream any in-flight gesture is abandoned (see
+    /// `process`): by then the synthesizer's watchdog has cancelled the held-⌘ switch and
+    /// the suppressor has self-healed, so resuming would only fire steps into a dead
+    /// session. A live gesture — even fingers resting to read the HUD — delivers frames
+    /// far more often than this. Shared with the synthesizer and suppressor so all agree.
+    private let staleFrameGap = GestureTuning.staleStreamGap
 
     /// Tunables read on the hot path and written from the UI thread. Bundling them
     /// behind one unfair lock means the per-frame path takes a single lock.
@@ -128,12 +147,28 @@ final class GestureRecognizer: @unchecked Sendable {
     private var lastValidCount: Int = 0
     private var movedTooFar = false
     private var swipeStartTime: Double = 0
+    /// Timestamp of the previous frame, used to detect a stalled-then-resumed stream.
+    private var lastTimestamp: Double = 0
+    /// Consecutive frames seen with fewer than three contacts while swiping (debounce).
+    private var lowFrameCount: Int = 0
 
     // MARK: Hot path
 
     func process(_ touches: UnsafePointer<MTTouch>, count: Int, timestamp: Double,
                  widthMM: Float, heightMM: Float) {
         let cfg = config.withLock { $0 }
+
+        // If the stream stalled and resumed, abandon any in-flight gesture instead of
+        // resuming it: the synthesizer's watchdog has released a held ⌘ and the switcher
+        // is gone, so further steps would silently no-op while still firing phantom
+        // feedback. Emitting .cancel also releases ⌘ through the normal path in case the
+        // watchdog hasn't fired yet (it's a no-op if it has). Resuming fingers then begin
+        // a fresh gesture via the .idle case below.
+        if phase != .idle, timestamp - lastTimestamp > staleFrameGap {
+            if phase == .swiping { onAction?(.cancel) }
+            reset()
+        }
+        lastTimestamp = timestamp
 
         // The edge band only filters palms when a gesture is *starting*; once we're
         // tracking, fingers are free to sweep toward an edge without being dropped.
@@ -217,7 +252,7 @@ final class GestureRecognizer: @unchecked Sendable {
             let dyMM = (cy - anchorY) * heightMM
             let adx = abs(dxMM), ady = abs(dyMM)
             if config.appSwitchEnabled, adx >= config.swipeDistanceMM, adx > entryDominance * ady {
-                enterSwiping(dx: dxMM, cx: cx, cy: cy, timestamp: timestamp)
+                enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
             } else if hypotf(dxMM, dyMM) > tapMoveCancelMM {
                 movedTooFar = true
             }
@@ -225,11 +260,16 @@ final class GestureRecognizer: @unchecked Sendable {
         // valid == 1 or 2: a transitional lift — keep waiting.
     }
 
-    private func enterSwiping(dx: Float, cx: Float, cy: Float, timestamp: Double) {
+    private func enterSwiping(cx: Float, cy: Float, timestamp: Double) {
         phase = .swiping
         swipeStartTime = timestamp
         onAction?(.swipeBegin)
-        onAction?(.swipeStep(dx > 0 ? .forward : .backward))
+        // The first step always opens forward (⌘Tab), regardless of swipe direction.
+        // Tapping ⌘Tab opens the switcher already moved one app forward (to the previous
+        // app), so a quick flick *either* way lands on the previous app — a left flick
+        // never jumps to the oldest app. Direction only starts to matter once the HUD is
+        // up and you scrub: handleSwiping steps backward (⌘⇧Tab) for leftward travel.
+        onAction?(.swipeStep(.forward))
         anchorX = cx
         anchorY = cy
     }
@@ -241,14 +281,33 @@ final class GestureRecognizer: @unchecked Sendable {
             reset()
             return
         }
-        if valid <= 1 {
+        if valid == 0 {
+            // All fingers lifted — commit the highlighted app.
             onAction?(.swipeCommit)
             reset()
             return
         }
-        // 2 or 3 fingers still down.
+        if valid < 3 {
+            // Only three fingers drive the switch. One or two contacts means the user is
+            // lifting to commit, or a contact momentarily dropped out mid-scrub. Don't
+            // step — two-finger motion isn't an app-switch (and would fight macOS's own
+            // two-finger swipe). Debounce a few frames so a one-frame dropout doesn't cut
+            // a scrub short, then commit if the low count persists. Re-anchor so a
+            // recovered third contact's centroid shift isn't read as travel.
+            lowFrameCount += 1
+            if lowFrameCount >= endDebounceFrames {
+                onAction?(.swipeCommit)
+                reset()
+                return
+            }
+            anchorX = cx
+            anchorY = cy
+            return
+        }
+        // valid == 3: the only state that steps.
+        lowFrameCount = 0
         if valid != lastValidCount {
-            anchorX = cx          // re-anchor on a finger add/relift
+            anchorX = cx          // re-anchor after the third contact returns
             anchorY = cy
             return
         }
@@ -281,6 +340,8 @@ final class GestureRecognizer: @unchecked Sendable {
         lastValidCount = 0
         movedTooFar = false
         swipeStartTime = 0
+        lastTimestamp = 0
+        lowFrameCount = 0
     }
 
     private func reset() {

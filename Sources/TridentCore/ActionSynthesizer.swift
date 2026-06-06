@@ -7,6 +7,7 @@ import os
 private enum Key {
     static let command: CGKeyCode = 0x37
     static let tab: CGKeyCode = 0x30
+    static let escape: CGKeyCode = 0x35
 }
 
 /// Turns `GestureAction`s into posted CGEvents.
@@ -21,6 +22,7 @@ private enum Key {
 /// an instant, HUD-less switch.
 final class ActionSynthesizer: @unchecked Sendable {
 
+    private let log = Logger(subsystem: "com.trident.Trident", category: "ActionSynthesizer")
     private let eventQueue = DispatchQueue(label: "com.trident.events", qos: .userInteractive)
 
     // Keyboard chords combine with the session's modifier state so the switcher
@@ -40,8 +42,30 @@ final class ActionSynthesizer: @unchecked Sendable {
     // a long resting hold keep ⌘ down while still recovering from a dead stream.
     private var watchdog: DispatchSourceTimer?
     private let watchdogInterval: CFTimeInterval = 0.25
-    private let staleFrameThreshold: CFTimeInterval = 1.0
+    // A live gesture — even fingers resting to read the HUD — delivers frames far more
+    // often than this, so it only trips on a real stall. Shared with the recognizer and
+    // suppressor via GestureTuning.staleStreamGap so all three agree on "stalled".
+    private let staleFrameThreshold = GestureTuning.staleStreamGap
     private let lastFrameTime = OSAllocatedUnfairLock<CFTimeInterval>(initialState: 0)
+
+    /// Pause after pressing ⌘ before the first Tab can post. Posted back-to-back with
+    /// zero gap, the WindowServer can process Tab before the ⌘Tab session is armed —
+    /// the Tab then leaks to the front app and no switch happens. ~12 ms is below
+    /// perception but reliably orders the two (mirrors the middle-click down→up gap).
+    private let commandSettleMicros: UInt32 = 12_000
+
+    init() {
+        // The default local-events suppression interval (0.25 s) drops synthetic
+        // keystrokes posted in quick succession from the same source — exactly a fast
+        // HUD scrub (several ⌘Tab pairs inside 250 ms) — making it skip steps and land
+        // on the wrong app. Zero it so every step lands.
+        keyboardSource?.localEventsSuppressionInterval = 0
+        if keyboardSource == nil || mouseSource == nil {
+            // Events still post against the default source, but the tuning above is lost;
+            // surface it rather than failing silently.
+            log.error("CGEventSource creation failed; synthetic event tuning unavailable")
+        }
+    }
 
     /// Record that a touch frame arrived. Called per frame on the framework callback
     /// thread; lets the watchdog tell a resting gesture (frames still flowing) from a
@@ -69,8 +93,10 @@ final class ActionSynthesizer: @unchecked Sendable {
             pressCommand()
         case .swipeStep(let direction):
             tapTab(backward: direction == .backward)
-        case .swipeCommit, .cancel:
+        case .swipeCommit:
             releaseCommand()
+        case .cancel:
+            cancelSwitch()
         }
     }
 
@@ -98,34 +124,59 @@ final class ActionSynthesizer: @unchecked Sendable {
 
     private func pressCommand() {
         guard !commandHeld else { return }
+        // Mark ⌘ held only once the key-down actually posts. If event creation fails,
+        // leaving the flag false keeps tapTab/releaseCommand correctly no-op rather than
+        // leaking a bare Tab to the front app under a phantom-held ⌘.
+        guard postKey(Key.command, flags: .maskCommand, down: true) else { return }
         commandHeld = true
         startWatchdog()
-        if let event = CGEvent(keyboardEventSource: keyboardSource, virtualKey: Key.command, keyDown: true) {
-            event.flags = .maskCommand
-            event.post(tap: .cghidEventTap)
-        }
+        // Let the system register ⌘ as held before the first Tab (the next thing queued
+        // on this serial queue) posts, so the switch can't be lost to a too-fast chord.
+        usleep(commandSettleMicros)
     }
 
     private func tapTab(backward: Bool) {
         guard commandHeld else { return }
         var flags: CGEventFlags = .maskCommand
         if backward { flags.insert(.maskShift) }
-        for keyDown in [true, false] {
-            if let event = CGEvent(keyboardEventSource: keyboardSource, virtualKey: Key.tab, keyDown: keyDown) {
-                event.flags = flags
-                event.post(tap: .cghidEventTap)
-            }
-        }
+        postChord(Key.tab, flags: flags)
     }
 
     private func releaseCommand() {
         stopWatchdog()
         guard commandHeld else { return }
         commandHeld = false
-        if let event = CGEvent(keyboardEventSource: keyboardSource, virtualKey: Key.command, keyDown: false) {
-            event.flags = []
-            event.post(tap: .cghidEventTap)
+        postKey(Key.command, flags: [], down: false)
+    }
+
+    /// Post a single key event. Returns whether it was created and posted, so a caller
+    /// can keep its state in sync with what actually reached the system.
+    @discardableResult
+    private func postKey(_ key: CGKeyCode, flags: CGEventFlags, down: Bool) -> Bool {
+        guard let event = CGEvent(keyboardEventSource: keyboardSource, virtualKey: key, keyDown: down) else {
+            return false
         }
+        event.flags = flags
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
+    /// Post a key down then up (a discrete keypress) carrying the given modifier flags.
+    private func postChord(_ key: CGKeyCode, flags: CGEventFlags) {
+        postKey(key, flags: flags, down: true)
+        postKey(key, flags: flags, down: false)
+    }
+
+    /// Abort the switch without committing. Once the HUD is up, simply releasing ⌘
+    /// *activates* the highlighted app — so a cancel must press Escape first (while ⌘
+    /// is still held) to dismiss the switcher, leaving the original app frontmost, then
+    /// release ⌘. Without the Escape, a 4-finger "cancel" would do the opposite of
+    /// cancelling and switch to whatever was highlighted.
+    private func cancelSwitch() {
+        // Dismiss the HUD with Escape while ⌘ is still held (a plain ⌘ release would
+        // *activate* the highlighted app), then release ⌘ — net effect: no switch.
+        if commandHeld { postChord(Key.escape, flags: .maskCommand) }
+        releaseCommand()
     }
 
     // MARK: - Watchdog (eventQueue only)
@@ -139,7 +190,10 @@ final class ActionSynthesizer: @unchecked Sendable {
             guard let self, self.commandHeld else { return }
             let last = self.lastFrameTime.withLock { $0 }
             if CACurrentMediaTime() - last > self.staleFrameThreshold {
-                self.releaseCommand()
+                // Frames stopped mid-switch (sleep, disconnect, Bluetooth drop). Abandon
+                // via Escape — a plain ⌘ release here would silently commit whatever app
+                // the now-dead HUD had highlighted.
+                self.cancelSwitch()
             }
         }
         watchdog = timer
