@@ -40,13 +40,6 @@ private nonisolated(unsafe) var gTap: CFMachPort?
 /// Frame-gap beyond which a still-"active" gesture is assumed dead and self-cleared.
 private let gStaleGap = GestureTuning.staleStreamGap
 
-/// NSEvent gesture-event type raw values — not named `CGEventType` cases, so the tap
-/// mask and the callback match them by raw value. The system can misfire these from a
-/// sloppy three-finger tap it reads as a two-finger gesture: `smartMagnify` is a
-/// two-finger double-tap (Smart Zoom), `magnify` is a pinch.
-private let kSmartMagnify: UInt32 = 32
-private let kMagnify: UInt32 = 30
-
 private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
     // The system disables a tap that runs too long or is interrupted — re-enable.
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -74,15 +67,6 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
     let leftUntil = gSuppressLeftUntil
     let rightUntil = gSuppressRightUntil
     os_unfair_lock_unlock(&gSuppressLock)
-
-    // Trackpad gesture events (Smart Zoom = two-finger double-tap, pinch-magnify) that
-    // the system can misfire from a sloppy three-finger tap it reads as two fingers:
-    // swallow them while Trident owns the gesture and its (longer, secondary) tail, so a
-    // three-finger tap can't also trigger Smart Zoom. These are matched by raw value
-    // because they have no named CGEventType case.
-    if type.rawValue == kSmartMagnify || type.rawValue == kMagnify {
-        return (clickActive || now < rightUntil) ? nil : Unmanaged.passUnretained(event)
-    }
 
     switch type {
     case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
@@ -156,7 +140,6 @@ final class GestureEventSuppressor: @unchecked Sendable {
         func bit(_ type: CGEventType) -> CGEventMask { CGEventMask(1) << CGEventMask(type.rawValue) }
         let mask = bit(.leftMouseDown) | bit(.leftMouseUp) | bit(.rightMouseDown) | bit(.rightMouseUp)
             | bit(.mouseMoved) | bit(.leftMouseDragged) | bit(.rightMouseDragged) | bit(.otherMouseDragged)
-            | (CGEventMask(1) << CGEventMask(kSmartMagnify)) | (CGEventMask(1) << CGEventMask(kMagnify))
 
         // Session-level tap (Accessibility only — no Input Monitoring needed). A HID-level
         // tap was tried to swallow motion before the cursor moves, but the system moves the
