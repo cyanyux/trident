@@ -24,6 +24,8 @@ final class MenuBarController: NSObject {
     private let onToggleHaptics: () -> Void
     private let onToggleLaunchAtLogin: () -> Void
     private let onHideMenuBarIcon: () -> Void
+    private let onCheckForUpdates: () -> Void
+    private let onShowOnboarding: () -> Void
     private let onOpenAccessibility: () -> Void
     private let onQuit: () -> Void
 
@@ -59,6 +61,8 @@ final class MenuBarController: NSObject {
         onToggleHaptics: @escaping () -> Void,
         onToggleLaunchAtLogin: @escaping () -> Void,
         onHideMenuBarIcon: @escaping () -> Void,
+        onCheckForUpdates: @escaping () -> Void,
+        onShowOnboarding: @escaping () -> Void,
         onOpenAccessibility: @escaping () -> Void,
         onQuit: @escaping () -> Void
     ) {
@@ -72,6 +76,8 @@ final class MenuBarController: NSObject {
         self.onToggleHaptics = onToggleHaptics
         self.onToggleLaunchAtLogin = onToggleLaunchAtLogin
         self.onHideMenuBarIcon = onHideMenuBarIcon
+        self.onCheckForUpdates = onCheckForUpdates
+        self.onShowOnboarding = onShowOnboarding
         self.onOpenAccessibility = onOpenAccessibility
         self.onQuit = onQuit
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -105,6 +111,16 @@ final class MenuBarController: NSObject {
         accessibilityItem.target = self
         accessibilityItem.action = #selector(openAccessibility)
         menu.addItem(accessibilityItem)
+
+        menu.addItem(.separator())
+
+        let setup = NSMenuItem(title: "Setup Assistant…", action: #selector(showOnboarding), keyEquivalent: "")
+        setup.target = self
+        menu.addItem(setup)
+
+        let checkForUpdates = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        checkForUpdates.target = self
+        menu.addItem(checkForUpdates)
 
         menu.addItem(.separator())
 
@@ -329,6 +345,8 @@ final class MenuBarController: NSObject {
     @objc private func toggleHaptics() { onToggleHaptics() }
     @objc private func toggleLaunchAtLogin() { onToggleLaunchAtLogin() }
     @objc private func hideMenuBarIcon() { onHideMenuBarIcon() }
+    @objc private func checkForUpdates() { onCheckForUpdates() }
+    @objc private func showOnboarding() { onShowOnboarding() }
     @objc private func resetSwipeTapped() { onResetSwipe() }
     @objc private func resetPalmTapped() { onResetPalm() }
     @objc private func quit() { onQuit() }

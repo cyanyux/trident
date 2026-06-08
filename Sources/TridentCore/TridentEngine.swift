@@ -70,9 +70,19 @@ public final class TridentEngine: @unchecked Sendable {
 
     /// Stop reading the trackpad, remove the event tap, and release any held modifier.
     public func stop() {
+        // Stop frame production FIRST. `monitor.stop()` clears `gEnabled` under the callback's
+        // own lock, so no further frame can drive the recognizer to emit a fresh `.swipeBegin`
+        // — which would otherwise enqueue a ⌘ key-DOWN *after* our release and leave ⌘ stuck.
+        // (Releasing first, the old order, lost that race: an in-flight frame could re-press ⌘
+        // behind the release. Order doesn't change whether the key-up lands on a revoke — that
+        // is gated by TCC, not by stopping the monitor — so nothing is lost by going last.)
         monitor.stop()
+        // Now release ⌘ and BLOCK until the key-up has actually posted. Synchronous matters on
+        // app termination: an async release can be abandoned when the process exits, leaving ⌘
+        // held system-wide. The drain also flushes any action an in-flight frame enqueued just
+        // before `monitor.stop()` took hold, so the release is the last word.
+        synthesizer.releaseAllAndWait()
         suppressor.stop()
-        synthesizer.releaseAll()
     }
 
     /// Horizontal travel, in millimetres, required per app-switch step. Physical

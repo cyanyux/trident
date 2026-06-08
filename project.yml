@@ -6,6 +6,16 @@ options:
     macOS: "26.0"
   createIntermediateGroups: true
 
+# Sparkle drives in-app auto-update. It ships as a binary XCFramework over SPM;
+# Xcode embeds and (re)signs it into the app bundle automatically. Pinned to an
+# EXACT version (not `from:`) so the embedded framework matches the pinned CLI tools
+# in scripts/lib-sparkle.sh — a tool/framework skew can produce an appcast or
+# signature older installed clients mis-handle. Bump both together.
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: "2.6.0"
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -39,6 +49,7 @@ targets:
       - Sources/TridentApp
     dependencies:
       - target: TridentCore
+      - package: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.trident.Trident

@@ -9,8 +9,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let engine = TridentEngine()
     private var menuBar: MenuBarController!
+    private var updater: Updater!
+    private var onboarding: OnboardingController!
     private var permissionTimer: Timer?
     private var engineRunning = false
+    /// Last permission state observed by `refresh()`. Drives the adaptive poll cadence.
+    private var lastTrusted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -36,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Owns the whole auto-update lifecycle; created once and held for the app's
+        // lifetime so its scheduled background checks keep running.
+        updater = Updater()
+
         menuBar = MenuBarController(
             onToggleEnabled: { [weak self] in self?.toggleEnabled() },
             onToggleMiddleClick: { [weak self] in self?.toggleMiddleClick() },
@@ -47,24 +55,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onToggleHaptics: { [weak self] in self?.toggleHaptics() },
             onToggleLaunchAtLogin: { [weak self] in self?.toggleLaunchAtLogin() },
             onHideMenuBarIcon: { [weak self] in self?.hideMenuBarIcon() },
-            onOpenAccessibility: { Self.openAccessibilitySettings() },
+            onCheckForUpdates: { [weak self] in self?.updater.checkForUpdates() },
+            onShowOnboarding: { [weak self] in self?.onboarding.present() },
+            onOpenAccessibility: { AccessibilitySettings.openSettings() },
             onQuit: { NSApp.terminate(nil) }
+        )
+
+        // Drives the first-run wizard and the later "free the swipe" help panel.
+        onboarding = OnboardingController(
+            onSetMiddleClick: { [weak self] in self?.setMiddleClickEnabled($0) },
+            onSetAppSwitch: { [weak self] in self?.setAppSwitchEnabled($0) },
+            onComplete: { [weak self] in self?.refresh() }
         )
 
         // Honour a previously chosen "hide" across launches. Reopening the app
         // (see applicationShouldHandleReopen) brings the icon back.
         menuBar.setIconVisible(!Preferences.shared.hideMenuBarIcon)
 
-        // Prompt for Accessibility on first launch if it isn't granted yet.
-        if !AXIsProcessTrusted() {
-            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-        }
-
         refresh()
-        // Poll so the engine starts the moment permission is granted (and stops if
-        // it is later revoked) without requiring a relaunch.
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refresh() }
+        // Poll to start the engine when permission is granted and stop it if revoked,
+        // without a relaunch. The interval adapts to the current state (see
+        // schedulePermissionPoll): snappy while not-yet-trusted so a grant made with no
+        // onboarding window open still starts the engine within ~2 s, relaxed once trusted
+        // so the per-tick live-revoke probe runs rarely.
+        schedulePermissionPoll(trusted: lastTrusted)
+
+        // First launch: run the wizard (it drives the Accessibility grant + trackpad
+        // setup). Afterwards, only re-prompt for Accessibility if it's been revoked.
+        if !Preferences.shared.didOnboarding {
+            onboarding.present()
+        } else if !AXIsProcessTrusted() {
+            AccessibilitySettings.prompt()
         }
     }
 
@@ -91,13 +112,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleMiddleClick() {
-        Preferences.shared.middleClickEnabled.toggle()
+        setMiddleClickEnabled(!Preferences.shared.middleClickEnabled)
+    }
+
+    private func toggleAppSwitch() {
+        let enabled = !Preferences.shared.appSwitchEnabled
+        setAppSwitchEnabled(enabled)
+        // Enabling swipe→switch is only useful once the three-finger swipe is freed
+        // from Spaces. If the user turns it on (from the menu) while that conflict is
+        // still live, guide them through the fix — silently no-op when already resolved.
+        if enabled, TrackpadSettings.threeFingerHorizSwipeActive {
+            onboarding.presentSwipeConflictHelp()
+        }
+    }
+
+    /// Canonical gesture-pref setters (guarded against redundant work). Both the menu
+    /// `toggle*` actions and the onboarding wizard route through these; the
+    /// swipe-conflict helper is layered on top only in `toggleAppSwitch` (the menu
+    /// path), since the wizard has its own trackpad step.
+    private func setMiddleClickEnabled(_ on: Bool) {
+        guard Preferences.shared.middleClickEnabled != on else { return }
+        Preferences.shared.middleClickEnabled = on
         applyConfig()
         refresh()
     }
 
-    private func toggleAppSwitch() {
-        Preferences.shared.appSwitchEnabled.toggle()
+    private func setAppSwitchEnabled(_ on: Bool) {
+        guard Preferences.shared.appSwitchEnabled != on else { return }
+        Preferences.shared.appSwitchEnabled = on
         applyConfig()
         refresh()
     }
@@ -181,16 +223,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBar.setIconVisible(false)
     }
 
-    private static func openAccessibilitySettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-        NSWorkspace.shared.open(url)
+    // MARK: - Permission polling
+
+    /// One poll tick: reconcile, then re-arm the timer at a cadence chosen by the result.
+    /// (Only the timer path re-arms; direct `refresh()` calls from menu actions don't, so a
+    /// burst of toggles can't perturb the poll cadence.)
+    private func pollTick() {
+        refresh()
+        schedulePermissionPoll(trusted: lastTrusted)
+    }
+
+    /// (Re)arm the one-shot permission timer. Fast (2 s) while NOT trusted: that path is
+    /// cheap — `AXIsProcessTrusted()` reads false, so `AccessibilityMonitor.isTrusted()`
+    /// short-circuits and the active-tap revoke probe never runs — and a snappy tick means
+    /// the engine starts within ~2 s of the user granting Accessibility even when no
+    /// onboarding window is open to catch it first. Relaxed (5 s) once trusted: every tick
+    /// there pays for the live-revoke probe, and a revoke is rare and — with the tap
+    /// gesture-scoped — no longer a freeze risk, so a few seconds' notice is harmless.
+    private func schedulePermissionPoll(trusted: Bool) {
+        permissionTimer?.invalidate()
+        let interval: TimeInterval = trusted ? 5.0 : 2.0
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollTick() }
+        }
     }
 
     // MARK: - State
 
     /// Reconcile the engine and menu with current permission + preferences.
     private func refresh() {
-        let trusted = AXIsProcessTrusted()
+        // Authoritative check (not bare AXIsProcessTrusted(), whose cache stays stale-true
+        // after a revoke) — so the engine stops and the menu reflects reality when the user
+        // turns Accessibility off while we're running, instead of going silently dead.
+        let trusted = AccessibilityMonitor.isTrusted()
+        lastTrusted = trusted
         let shouldRun = trusted && Preferences.shared.isEnabled
 
         if shouldRun && !engineRunning {

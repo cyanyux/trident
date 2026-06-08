@@ -5,5 +5,12 @@ Trident.xcodeproj/
 build/
 DerivedData/
 
+# Sparkle CLI tools (downloaded on demand) and release artifacts
+.sparkle/
+dist/
+
+# Exported Sparkle private key — must never be committed
+sparkle_private_key.pem
+
 # macOS
 .DS_Store

@@ -83,6 +83,14 @@ final class ActionSynthesizer: @unchecked Sendable {
         eventQueue.async { [weak self] in self?.releaseCommand() }
     }
 
+    /// Release ⌘ and block until the key-up has posted. Used on engine teardown: a serial
+    /// `sync` runs after every action already queued (so a release can't race ahead of an
+    /// in-flight `.swipeBegin`), and being synchronous guarantees the key-up reaches the
+    /// system before the process can exit — so app termination can't leave ⌘ stuck.
+    func releaseAllAndWait() {
+        eventQueue.sync { releaseCommand() }
+    }
+
     // MARK: - eventQueue only
 
     private func perform(_ action: GestureAction) {

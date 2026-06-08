@@ -41,6 +41,7 @@ final class Preferences: @unchecked Sendable {
         static let palmEdgeBandMM = "palmEdgeBandMM"
         static let hideMenuBarIcon = "hideMenuBarIcon"
         static let didFirstRunSetup = "didFirstRunSetup"
+        static let didOnboarding = "didOnboarding"
     }
 
     private init() {
@@ -101,5 +102,12 @@ final class Preferences: @unchecked Sendable {
     var didFirstRunSetup: Bool {
         get { defaults.bool(forKey: Keys.didFirstRunSetup) }
         set { defaults.set(newValue, forKey: Keys.didFirstRunSetup) }
+    }
+
+    /// Whether the first-run onboarding wizard has been shown. Reset by the user
+    /// reopening it from the menu's Setup Assistant.
+    var didOnboarding: Bool {
+        get { defaults.bool(forKey: Keys.didOnboarding) }
+        set { defaults.set(newValue, forKey: Keys.didOnboarding) }
     }
 }
