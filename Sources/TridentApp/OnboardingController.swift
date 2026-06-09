@@ -41,8 +41,8 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         refreshDetections()
 
         if wizardWindow == nil {
-            let host = NSHostingController(rootView: OnboardingView(model: model))
-            wizardWindow = makeWindow(host, title: "Welcome to Trident")
+            wizardWindow = makeWindow(hostingController(OnboardingView(model: model)),
+                                      title: "Welcome to Trident")
         }
         startPolling()
         bringToFront(wizardWindow)
@@ -53,10 +53,10 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     func presentSwipeConflictHelp() {
         refreshDetections()
         if helpWindow == nil {
-            let host = NSHostingController(
-                rootView: SwipeConflictHelpView(model: model) { [weak self] in self?.helpWindow?.close() }
+            helpWindow = makeWindow(
+                hostingController(SwipeConflictHelpView(model: model) { [weak self] in self?.helpWindow?.close() }),
+                title: "Swipe → Switch App"
             )
-            helpWindow = makeWindow(host, title: "Swipe → Switch App")
         }
         startPolling()
         bringToFront(helpWindow)
@@ -101,6 +101,24 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     // MARK: - Window helpers
 
+    /// Wrap a SwiftUI root in a hosting controller sized by its **intrinsic content
+    /// size only**.
+    ///
+    /// The default (`.standardBounds`) also makes the hosting view pin the *window's*
+    /// content min/max size. Computing those extrema runs *inside* the window's
+    /// Update-Constraints pass, and that computation re-marks the window as needing
+    /// another pass — on macOS 26+ AppKit treats the resulting runaway ("more constraint
+    /// passes than views in the window") as a **fatal exception**, not a warning. It
+    /// detonated when a status-bar menu's nested event loop pumped a display-cycle flush
+    /// over an open onboarding window. Neither window is user-resizable, so the min/max
+    /// extrema bought nothing; intrinsic size alone sizes them correctly without the
+    /// reentrant path. (See also `makeWindow`, which settles the first pass at creation.)
+    private func hostingController<V: View>(_ rootView: V) -> NSHostingController<V> {
+        let host = NSHostingController(rootView: rootView)
+        host.sizingOptions = [.intrinsicContentSize]
+        return host
+    }
+
     private func makeWindow(_ vc: NSViewController, title: String) -> NSWindow {
         let win = NSWindow(contentViewController: vc)
         win.title = title
@@ -117,6 +135,11 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         // it pinned near the top, since the content then grows downward from there.
         vc.view.layoutSubtreeIfNeeded()
         win.setContentSize(vc.view.fittingSize)
+        // Settle the window's first Update-Constraints pass here — synchronously and off
+        // any nested run loop — so it can't first run (and run away) later during a
+        // display-cycle flush driven by a menu's tracking loop. Second half of the
+        // macOS-26 layout-runaway guard; see hostingController(_:).
+        win.layoutIfNeeded()
         win.center()
         return win
     }
