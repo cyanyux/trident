@@ -15,7 +15,13 @@ final class OnboardingModel: ObservableObject {
         didSet { onSetMiddleClick?(middleClickEnabled) }
     }
     @Published var appSwitchEnabled = true {
-        didSet { onSetAppSwitch?(appSwitchEnabled) }
+        didSet {
+            onSetAppSwitch?(appSwitchEnabled)
+            // Turning swipe off drops the trackpad step; re-clamp so an index past the
+            // shrunken list can't strand navigation (Back would land on the same step)
+            // or leave the page dots with no active dot.
+            stepIndex = min(stepIndex, steps.count - 1)
+        }
     }
 
     @Published var stepIndex = 0
@@ -234,10 +240,7 @@ struct OnboardingView: View {
     }
 
     private func heroSymbol(_ name: String, _ tint: Color) -> some View {
-        Image(systemName: name)
-            .font(.system(size: 40, weight: .semibold))
-            .symbolRenderingMode(.hierarchical)
-            .foregroundStyle(tint)
+        HeroChip(symbol: name, tint: tint)
     }
 
     // MARK: - Footer (functional layer — Liquid Glass)
@@ -316,10 +319,7 @@ struct SwipeConflictHelpView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             VStack(alignment: .leading, spacing: 16) {
-                Image(systemName: "hand.draw.fill")
-                    .font(.system(size: 40, weight: .semibold))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.indigo)
+                HeroChip(symbol: "hand.draw.fill", tint: .indigo)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Free the three-finger swipe").font(.largeTitle.bold())
                     Text("You turned on Swipe → Switch App. macOS uses that same three-finger swipe to switch Spaces — reassign it below so they don't collide:")
@@ -352,6 +352,22 @@ struct SwipeConflictHelpView: View {
 }
 
 // MARK: - Shared content components (no glass — these live on the content layer)
+
+/// Hero glyph in a tinted rounded-square chip — the same visual language as the
+/// welcome step's feature rows (and System Settings' section icons), so every step
+/// header reads as part of one family instead of a bare floating symbol.
+struct HeroChip: View {
+    let symbol: String
+    let tint: Color
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 28, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(tint)
+            .frame(width: 60, height: 60)
+            .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
 
 /// A ✓/pending status line. State is conveyed by the symbol + color, not a background.
 struct StatusRow: View {

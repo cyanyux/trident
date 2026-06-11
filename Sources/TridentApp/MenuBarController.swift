@@ -114,6 +114,8 @@ final class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
+        // HIG: trailing ellipsis on commands that open a window needing further
+        // interaction before they complete — both of these do.
         let setup = NSMenuItem(title: "Setup Assistant…", action: #selector(showOnboarding), keyEquivalent: "")
         setup.target = self
         menu.addItem(setup)
@@ -124,7 +126,7 @@ final class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
-        let hide = NSMenuItem(title: "Hide Menu Bar Icon", action: #selector(hideMenuBarIcon), keyEquivalent: "")
+        let hide = NSMenuItem(title: "Hide Menu Bar Icon…", action: #selector(hideMenuBarIcon), keyEquivalent: "")
         hide.target = self
         menu.addItem(hide)
 
@@ -156,11 +158,13 @@ final class MenuBarController: NSObject {
         swipeResetButton = addSliderSection(title: "Swipe sensitivity", slider: swipeSlider, value: swipeValueLabel,
                          min: SwipeTuning.minMM, max: SwipeTuning.maxMM, defaultMM: SwipeTuning.defaultMM,
                          action: #selector(swipeChanged(_:)), resetAction: #selector(resetSwipeTapped))
+        swipeSlider.toolTip = "Horizontal finger travel per app-switch step — smaller is more sensitive"
 
         panel.addArrangedSubview(separatorLine())
-        palmResetButton = addSliderSection(title: "Palm rejection (edge band)", slider: palmSlider, value: palmValueLabel,
+        palmResetButton = addSliderSection(title: "Palm rejection", slider: palmSlider, value: palmValueLabel,
                          min: PalmTuning.minMM, max: PalmTuning.maxMM, defaultMM: PalmTuning.defaultMM,
                          action: #selector(palmChanged(_:)), resetAction: #selector(resetPalmTapped))
+        palmSlider.toolTip = "Band in from the trackpad edge where touches are ignored at gesture start"
 
         panel.addArrangedSubview(separatorLine())
         configure(hapticButton, title: "Haptic Feedback", action: #selector(toggleHaptics))
@@ -217,6 +221,10 @@ final class MenuBarController: NSObject {
         return label
     }
 
+    /// One compact tuning section: a header row of title — value — reset glyph, with
+    /// the slider beneath. The reset button is a borderless ↺ that `update(...)` shows
+    /// only while the value is off its default, replacing the old full-width
+    /// "Default: x mm / Reset to Default" row — same affordance, half the chrome.
     @discardableResult
     private func addSliderSection(title: String, slider: NSSlider, value: NSTextField,
                                   min: Float, max: Float, defaultMM: Float,
@@ -224,11 +232,27 @@ final class MenuBarController: NSObject {
         let titleLabel = makeLabel(title)
         titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         value.alignment = .right
+        value.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        value.textColor = .secondaryLabelColor
         value.translatesAutoresizingMaskIntoConstraints = false
         value.setContentHuggingPriority(.required, for: .horizontal)
-        let top = NSStackView(views: [titleLabel, value])
+
+        let resetButton = NSButton(
+            image: NSImage(systemSymbolName: "arrow.counterclockwise.circle.fill",
+                           accessibilityDescription: "Reset to default")
+                ?? NSImage(),
+            target: self, action: resetAction
+        )
+        resetButton.isBordered = false
+        resetButton.contentTintColor = .secondaryLabelColor
+        resetButton.toolTip = "Reset to default (\(fmtShort(defaultMM)) mm)"
+        resetButton.setContentHuggingPriority(.required, for: .horizontal)
+        resetButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let top = NSStackView(views: [titleLabel, value, resetButton])
         top.orientation = .horizontal
         top.distribution = .fill
+        top.spacing = 5
         top.translatesAutoresizingMaskIntoConstraints = false
         top.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
 
@@ -240,27 +264,24 @@ final class MenuBarController: NSObject {
         slider.translatesAutoresizingMaskIntoConstraints = false
         slider.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
 
-        // Default note on the left, this section's own reset button on the right.
-        let defaultLabel = makeLabel("Default: \(fmtShort(defaultMM)) mm", secondary: true)
-        defaultLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let resetButton = NSButton(title: "Reset to Default", target: self, action: resetAction)
-        resetButton.bezelStyle = .rounded
-        resetButton.controlSize = .small
-        resetButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        resetButton.setContentHuggingPriority(.required, for: .horizontal)
-        resetButton.translatesAutoresizingMaskIntoConstraints = false
-        let bottom = NSStackView(views: [defaultLabel, resetButton])
-        bottom.orientation = .horizontal
-        bottom.distribution = .fill
-        bottom.translatesAutoresizingMaskIntoConstraints = false
-        bottom.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-
         panel.addArrangedSubview(top)
         panel.addArrangedSubview(slider)
-        panel.addArrangedSubview(bottom)
         panel.setCustomSpacing(6, after: top)
-        panel.setCustomSpacing(4, after: slider)
         return resetButton
+    }
+
+    /// Small filled dot conveying the engine state at a glance. Drawn as a plain
+    /// bitmap, NOT an SF Symbol: menu items render symbol images as templates —
+    /// tinted to the menu's text color, palette configuration ignored — which made a
+    /// colored `circle.fill` invisible against the menu background.
+    private func statusDot(_ color: NSColor) -> NSImage {
+        let image = NSImage(size: NSSize(width: 10, height: 10), flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
     }
 
     private func fmtShort(_ mm: Float) -> String {
@@ -299,12 +320,16 @@ final class MenuBarController: NSObject {
     ) {
         if !accessibilityGranted {
             statusLine.title = "Needs Accessibility permission"
+            statusLine.image = statusDot(.systemOrange)
         } else if running {
             statusLine.title = "Active"
+            statusLine.image = statusDot(.systemGreen)
         } else if !enabled {
             statusLine.title = "Paused"
+            statusLine.image = statusDot(.systemGray)
         } else {
-            statusLine.title = "Inactive"
+            statusLine.title = "Inactive"   // enabled + permitted but no trackpad responding
+            statusLine.image = statusDot(.systemRed)
         }
 
         enabledButton.state = enabled ? .on : .off
@@ -324,6 +349,9 @@ final class MenuBarController: NSObject {
         swipeValueLabel.stringValue = fmtValue(swipeDistanceMM)
         setSlider(palmSlider, to: palmEdgeBandMM)
         palmValueLabel.stringValue = fmtValue(palmEdgeBandMM)
+        // The reset glyphs only appear while there is something to reset.
+        swipeResetButton.isHidden = abs(swipeDistanceMM - SwipeTuning.defaultMM) < 0.05
+        palmResetButton.isHidden = abs(palmEdgeBandMM - PalmTuning.defaultMM) < 0.05
 
         hapticButton.state = hapticFeedback ? .on : .off
         launchButton.state = launchAtLogin ? .on : .off

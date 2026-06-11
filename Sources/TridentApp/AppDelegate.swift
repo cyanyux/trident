@@ -65,20 +65,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onboarding = OnboardingController(
             onSetMiddleClick: { [weak self] in self?.setMiddleClickEnabled($0) },
             onSetAppSwitch: { [weak self] in self?.setAppSwitchEnabled($0) },
-            onComplete: { [weak self] in self?.refresh() }
+            // Reprobe: the wizard usually closes right after the user granted
+            // Accessibility, and the engine should start immediately, not at next poll.
+            onComplete: { [weak self] in self?.refresh(reprobe: true) }
         )
 
         // Honour a previously chosen "hide" across launches. Reopening the app
         // (see applicationShouldHandleReopen) brings the icon back.
         menuBar.setIconVisible(!Preferences.shared.hideMenuBarIcon)
 
-        refresh()
+        refresh(reprobe: true)
         // Poll to start the engine when permission is granted and stop it if revoked,
         // without a relaunch. The interval adapts to the current state (see
         // schedulePermissionPoll): snappy while not-yet-trusted so a grant made with no
         // onboarding window open still starts the engine within ~2 s, relaxed once trusted
         // so the per-tick live-revoke probe runs rarely.
         schedulePermissionPoll(trusted: lastTrusted)
+
+        // The multitouch devices are enumerated once per engine start, and the framework
+        // can tear its device objects down across sleep — so restart the engine on wake,
+        // or gestures could go silently dead until a relaunch. Late arrivals (a Bluetooth
+        // trackpad reconnecting after wake) are caught by the poll's device-list check.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.restartEngine() }
+        }
 
         // First launch: run the wizard (it drives the Accessibility grant + trackpad
         // setup). Afterwards, only re-prompt for Accessibility if it's been revoked.
@@ -200,12 +212,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleLaunchAtLogin() {
+        let enable = !LoginItem.isEnabled
+        if enable, LoginItem.requiresApproval {
+            // Registered but switched off / awaiting approval in System Settings —
+            // register() can't flip that back; only the user can, so take them there.
+            LoginItem.openSettings()
+            refresh()
+            return
+        }
         do {
-            try LoginItem.setEnabled(!LoginItem.isEnabled)
+            try LoginItem.setEnabled(enable)
         } catch {
             NSLog("Trident: failed to update login item: \(error)")
+            presentLoginItemError(error, enabling: enable)
         }
         refresh()
+    }
+
+    /// A failed toggle silently snapping back reads as a dead checkbox — say what
+    /// happened and offer the Settings pane where it can always be fixed by hand.
+    private func presentLoginItemError(_ error: Error, enabling: Bool) {
+        let alert = NSAlert()
+        alert.messageText = enabling
+            ? "Couldn’t enable Launch at Login"
+            : "Couldn’t disable Launch at Login"
+        alert.informativeText = error.localizedDescription
+            + "\n\nYou can also manage this under System Settings ▸ General ▸ Login Items & Extensions."
+        alert.addButton(withTitle: "Open Login Items Settings")
+        alert.addButton(withTitle: "Cancel")
+        if let icon = NSImage(named: "AppIconImage") { alert.icon = icon }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            LoginItem.openSettings()
+        }
     }
 
     /// Hide the menu bar icon after confirming, since it's the only way into the app.
@@ -229,8 +268,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// (Only the timer path re-arms; direct `refresh()` calls from menu actions don't, so a
     /// burst of toggles can't perturb the poll cadence.)
     private func pollTick() {
-        refresh()
+        // A trackpad connected or dropped since the engine enumerated devices? Restart so
+        // it reads the current set (a Magic Trackpad arriving after launch is otherwise
+        // never registered; one that reconnected is registered on a dead handle).
+        if engineRunning, engine.deviceListChanged() {
+            restartEngine()
+        }
+        refresh(reprobe: true)
         schedulePermissionPoll(trusted: lastTrusted)
+    }
+
+    /// Stop and (via `refresh`) restart the engine so it re-enumerates devices — after
+    /// wake, or when the trackpad set changed. No-op unless the engine is running.
+    private func restartEngine() {
+        guard engineRunning else { return }
+        engine.stop()
+        engineRunning = false
+        refresh()
     }
 
     /// (Re)arm the one-shot permission timer. Fast (2 s) while NOT trusted: that path is
@@ -243,19 +297,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func schedulePermissionPoll(trusted: Bool) {
         permissionTimer?.invalidate()
         let interval: TimeInterval = trusted ? 5.0 : 2.0
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.pollTick() }
         }
+        // .common, not the default mode: a default-mode timer doesn't fire while a menu
+        // is being tracked or a modal alert runs, which silently paused revoke detection
+        // for as long as the status menu stayed open.
+        RunLoop.main.add(timer, forMode: .common)
+        permissionTimer = timer
     }
 
     // MARK: - State
 
     /// Reconcile the engine and menu with current permission + preferences.
-    private func refresh() {
-        // Authoritative check (not bare AXIsProcessTrusted(), whose cache stays stale-true
-        // after a revoke) — so the engine stops and the menu reflects reality when the user
-        // turns Accessibility off while we're running, instead of going silently dead.
-        let trusted = AccessibilityMonitor.isTrusted()
+    ///
+    /// `reprobe` re-checks the live Accessibility state via `AccessibilityMonitor` — the
+    /// authoritative check (not bare AXIsProcessTrusted(), whose cache stays stale-true
+    /// after a revoke), so the engine stops and the menu reflects reality when the user
+    /// turns Accessibility off while we're running. Only the poll (and launch/onboarding
+    /// completion) reprobe; menu actions use the cached state — a continuous slider drag
+    /// fires this on every tick, and each probe is a WindowServer round-trip that has no
+    /// business running per-tick when the poll re-checks within seconds anyway.
+    private func refresh(reprobe: Bool = false) {
+        let trusted = reprobe ? AccessibilityMonitor.isTrusted() : lastTrusted
         lastTrusted = trusted
         let shouldRun = trusted && Preferences.shared.isEnabled
 

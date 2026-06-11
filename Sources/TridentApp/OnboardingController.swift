@@ -82,9 +82,13 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     private func startPolling() {
         guard pollTimer == nil else { return }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshDetections() }
         }
+        // .common so live detection keeps updating while a menu is open or the window
+        // is being dragged (default-mode timers pause during those tracking loops).
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
     }
 
     private func stopPolling() {
