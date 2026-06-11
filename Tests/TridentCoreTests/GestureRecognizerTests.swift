@@ -76,6 +76,70 @@ final class GestureRecognizerTests: XCTestCase {
         XCTAssertEqual(actions, [.middleClick])
     }
 
+    /// A quick Launchpad pinch (thumb + three fingers) whose thumb was palm-rejected
+    /// presents as three brief contacts converging on a *stationary centroid* — the
+    /// blind spot of the centroid-travel check. The spread change must disqualify the
+    /// tap, or launching Launchpad fires a stray middle click.
+    func testThumbRejectedPinchDoesNotMiddleClick() {
+        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.00)
+        feed([contact(0.46, 0.5), contact(0.50, 0.5), contact(0.54, 0.5)], at: 0.05)  // converging
+        feed([], at: 0.08)                                                            // quick lift
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Same for show desktop: fingers fanning out around a stationary centroid.
+    func testThumbRejectedSpreadDoesNotMiddleClick() {
+        feed([contact(0.45, 0.5), contact(0.50, 0.5), contact(0.55, 0.5)], at: 0.00)
+        feed([contact(0.38, 0.5), contact(0.50, 0.5), contact(0.62, 0.5)], at: 0.05)  // fanning out
+        feed([], at: 0.08)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Mid-pinch, converging fingertips merge into fewer sensor contacts — much of the
+    /// travel shows up at *two* contacts. The spread check must keep watching there.
+    func testPinchConvergingAtTwoContactsDoesNotMiddleClick() {
+        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.00)
+        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.02)
+        feed([contact(0.44, 0.5), contact(0.56, 0.5)], at: 0.04)   // two fingers merged
+        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.06)   // still converging
+        feed([], at: 0.08)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A Launchpad pinch whose thumb IS counted shows 4 contacts mid-gesture, and its
+    /// tail flickers back through exactly three as fingers merge and lift. The
+    /// post-4-finger quarantine must keep that flicker from opening a fresh tap window.
+    func testThreeContactFlickerAfterFourFingersDoesNotMiddleClick() {
+        feed(threeFingers(centerX: 0.5), at: 0.00)
+        feed([contact(0.35, 0.5), contact(0.45, 0.5), contact(0.55, 0.5), contact(0.65, 0.35)], at: 0.03)
+        feed(threeFingers(centerX: 0.5), at: 0.05)   // tail flicker — re-arms quarantined
+        feed(threeFingers(centerX: 0.5), at: 0.08)
+        feed([], at: 0.10)                            // quick lift inside the tap window
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Same for the sub-3 dwell bound: a slow pinch dwells at two merged contacts long
+    /// enough to trip it, then flickers back to three on the way out.
+    func testThreeContactFlickerAfterDwellResetDoesNotMiddleClick() {
+        feed(threeFingers(centerX: 0.5), at: 0.00)
+        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.20)   // dwell past tap window
+        feed(threeFingers(centerX: 0.5), at: 0.25)                  // tail flicker
+        feed(threeFingers(centerX: 0.5), at: 0.28)
+        feed([], at: 0.31)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A clean tap never quarantines — an immediate deliberate re-tap still clicks.
+    func testRapidDoubleTapClicksTwice() {
+        feed(threeFingers(centerX: 0.5), at: 0.00)
+        feed(threeFingers(centerX: 0.5), at: 0.05)
+        feed([], at: 0.08)
+        feed(threeFingers(centerX: 0.5), at: 0.12)
+        feed(threeFingers(centerX: 0.5), at: 0.16)
+        feed([], at: 0.19)
+        XCTAssertEqual(actions, [.middleClick, .middleClick])
+    }
+
     func testSingleFrameTapIsIgnored() {
         feed(threeFingers(centerX: 0.5), at: 0.00)   // only one frame before lift
         feed([], at: 0.02)

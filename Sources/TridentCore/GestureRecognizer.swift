@@ -67,6 +67,26 @@ final class GestureRecognizer: @unchecked Sendable {
     /// Any centroid travel (mm) beyond this — that isn't a swipe — disqualifies the
     /// tap, so vertical three-finger swipes don't register as middle clicks.
     private let tapMoveCancelMM: Float = 3.0
+    /// Any change (mm) in the contacts' spread — mean distance from their centroid —
+    /// beyond this also disqualifies the tap. A pinch or spread (Launchpad / show
+    /// desktop: thumb + three fingers, with the thumb often palm-rejected at the rim)
+    /// moves the fingers symmetrically, so the *centroid* stays put while the fingers
+    /// converge or fan out — exactly the blind spot of the centroid-travel check that
+    /// made a quick Launchpad pinch fire a middle click. A real tap's spread is static.
+    /// Checked on 2-contact frames as well: converging fingertips merge into fewer
+    /// sensor contacts, so much of a pinch's travel happens *after* the count drops.
+    private let tapSpreadCancelMM: Float = 3.0
+
+    /// After a gesture ends abnormally — 4+ fingers seen (a system gesture like
+    /// Launchpad / show desktop / Mission Control), the sub-3 dwell bound, or a stalled
+    /// stream — a re-armed gesture starting within this window is tap-disqualified from
+    /// birth (swipes are unaffected). The tail of a system gesture flickers through
+    /// exactly three contacts as fingers merge and lift; without the quarantine each
+    /// flicker re-armed tracking with a fresh, pristine tap window, so the *end* of a
+    /// Launchpad pinch could still fire a middle click no matter what the earlier
+    /// frames showed. A clean lift to zero never quarantines, so deliberate rapid
+    /// re-taps stay instant.
+    private let tapQuarantine: Double = 0.3
 
     // Swipe geometry.
     private let entryDominance: Float = 1.5   // |Δx| must beat |Δy| by this to start a swipe
@@ -142,6 +162,9 @@ final class GestureRecognizer: @unchecked Sendable {
     private var phase: Phase = .idle
     private var anchorX: Float = 0
     private var anchorY: Float = 0
+    /// Contact spread (mm) at the anchor, compared against the live spread to catch
+    /// pinches/spreads whose centroid stays put (see `tapSpreadCancelMM`).
+    private var anchorSpread: Float = 0
     private var startTime: Double = 0
     private var frameCount: Int = 0
     private var lastValidCount: Int = 0
@@ -149,6 +172,9 @@ final class GestureRecognizer: @unchecked Sendable {
     private var swipeStartTime: Double = 0
     /// Timestamp of the previous frame, used to detect a stalled-then-resumed stream.
     private var lastTimestamp: Double = 0
+    /// Gestures re-armed before this (device-stream) timestamp start tap-disqualified
+    /// (see `tapQuarantine`).
+    private var quarantineUntil: Double = 0
     /// Consecutive frames seen with fewer than three contacts while swiping (debounce).
     private var lowFrameCount: Int = 0
 
@@ -166,6 +192,7 @@ final class GestureRecognizer: @unchecked Sendable {
         // a fresh gesture via the .idle case below.
         if phase != .idle, timestamp - lastTimestamp > staleFrameGap {
             if phase == .swiping { onAction?(.cancel) }
+            quarantineUntil = timestamp + tapQuarantine
             reset()
         }
         lastTimestamp = timestamp
@@ -194,15 +221,35 @@ final class GestureRecognizer: @unchecked Sendable {
         let cx = valid > 0 ? sumX / Float(valid) : 0
         let cy = valid > 0 ? sumY / Float(valid) : 0
 
+        // Mean contact distance from the centroid, in mm — the "spread". A second pass
+        // with the same contact/palm filter as above; a frame holds at most a handful
+        // of touches, so this stays allocation-free and cheap.
+        var spreadMM: Float = 0
+        if valid > 0 {
+            var sumDist: Float = 0
+            for i in 0..<count {
+                let t = touches[i]
+                guard TouchState.isContact(t.state) else { continue }
+                let p = t.normalizedVector.position
+                if isPalm(position: p, size: t.zTotal, edgeBandMM: cfg.palmEdgeBandMM,
+                          maxSize: cfg.palmMaxSize, widthMM: widthMM, heightMM: heightMM,
+                          applyEdgeBand: entering) {
+                    continue
+                }
+                sumDist += hypotf((p.x - cx) * widthMM, (p.y - cy) * heightMM)
+            }
+            spreadMM = sumDist / Float(valid)
+        }
+
         switch phase {
         case .idle:
             // Only arm a gesture when at least one mapping can actually fire; otherwise
             // three fingers would needlessly drive the click suppressor for no benefit.
             if valid == 3, cfg.middleClickEnabled || cfg.appSwitchEnabled {
-                beginTracking(cx: cx, cy: cy, timestamp: timestamp)
+                beginTracking(cx: cx, cy: cy, spreadMM: spreadMM, timestamp: timestamp)
             }
         case .tracking:
-            handleTracking(valid: valid, cx: cx, cy: cy, timestamp: timestamp,
+            handleTracking(valid: valid, cx: cx, cy: cy, spreadMM: spreadMM, timestamp: timestamp,
                            config: cfg, widthMM: widthMM, heightMM: heightMM)
         case .swiping:
             handleSwiping(valid: valid, cx: cx, cy: cy, timestamp: timestamp,
@@ -213,20 +260,27 @@ final class GestureRecognizer: @unchecked Sendable {
 
     // MARK: Phases
 
-    private func beginTracking(cx: Float, cy: Float, timestamp: Double) {
+    private func beginTracking(cx: Float, cy: Float, spreadMM: Float, timestamp: Double) {
         phase = .tracking
         anchorX = cx
         anchorY = cy
+        anchorSpread = spreadMM
         startTime = timestamp
         frameCount = 1
-        movedTooFar = false
+        // Born inside the quarantine window (the flickering tail of a system gesture)
+        // → tap-disqualified from the start. Swipes don't consult this flag.
+        movedTooFar = timestamp < quarantineUntil
         onGestureActiveChanged?(true)
     }
 
-    private func handleTracking(valid: Int, cx: Float, cy: Float, timestamp: Double,
+    private func handleTracking(valid: Int, cx: Float, cy: Float, spreadMM: Float, timestamp: Double,
                                 config: Config, widthMM: Float, heightMM: Float) {
         if valid >= 4 {
-            reset()  // 4+ fingers belong to the system (Mission Control, etc.)
+            // 4+ fingers belong to the system (Mission Control, Launchpad, show
+            // desktop). Quarantine the re-arm: those gestures' tails flicker through
+            // exactly three contacts, which must not open a fresh tap window.
+            quarantineUntil = timestamp + tapQuarantine
+            reset()
             return
         }
         if valid == 0 {
@@ -239,31 +293,40 @@ final class GestureRecognizer: @unchecked Sendable {
             reset()
             return
         }
-        if valid == 3 {
-            if lastValidCount != 3 {
-                // Re-acquired three fingers after a dip — re-anchor so the
-                // centroid jump doesn't read as travel.
-                anchorX = cx
-                anchorY = cy
-                return
-            }
-            frameCount += 1
+        if valid != lastValidCount {
+            // Contact count changed (a dip, a re-acquired finger, or fingertips
+            // merging mid-pinch) — re-anchor so the centroid/spread jump between
+            // different contact sets doesn't read as motion.
+            anchorX = cx
+            anchorY = cy
+            anchorSpread = spreadMM
+        } else {
+            if valid == 3 { frameCount += 1 }
             let dxMM = (cx - anchorX) * widthMM
             let dyMM = (cy - anchorY) * heightMM
             let adx = abs(dxMM), ady = abs(dyMM)
-            if config.appSwitchEnabled, adx >= config.swipeDistanceMM, adx > entryDominance * ady {
+            if valid == 3, config.appSwitchEnabled,
+               adx >= config.swipeDistanceMM, adx > entryDominance * ady {
                 enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
-            } else if hypotf(dxMM, dyMM) > tapMoveCancelMM {
+                return
+            }
+            if hypotf(dxMM, dyMM) > tapMoveCancelMM
+                || abs(spreadMM - anchorSpread) > tapSpreadCancelMM {
+                // Centroid travel that isn't a swipe — or converging/fanning fingers
+                // (a Launchpad pinch / show-desktop spread whose thumb was palm-
+                // rejected). Checked at two contacts too: a pinch's fingertips merge,
+                // so much of its travel shows up after the count drops below three.
                 movedTooFar = true
             }
         }
-        // valid == 1 or 2: a transitional lift — wait, but only inside the tap window.
-        // Beyond it nothing pending can fire (a tap is already too old, and a swipe
-        // needs three fingers back — which re-arms just as well from idle), while the
-        // gesture-active latch keeps the suppressor eating every click system-wide.
-        // Without this bound, two fingers left resting after a three-finger touch
-        // suppressed all clicks indefinitely.
+        // Below three contacts, wait only inside the tap window. Beyond it nothing
+        // pending can fire (a tap is already too old, and a swipe needs three fingers
+        // back — which re-arms just as well from idle), while the gesture-active latch
+        // keeps the suppressor eating every click system-wide. Without this bound, two
+        // fingers left resting after a three-finger touch suppressed clicks forever.
+        // Quarantined: the dwell often *is* a system gesture's tail mid-merge.
         if valid < 3, timestamp - startTime > tapMaxDuration {
+            quarantineUntil = timestamp + tapQuarantine
             reset()
         }
     }
@@ -286,6 +349,7 @@ final class GestureRecognizer: @unchecked Sendable {
                                distanceMM: Float, widthMM: Float, heightMM: Float) {
         if valid >= 4 {
             onAction?(.cancel)
+            quarantineUntil = timestamp + tapQuarantine
             reset()
             return
         }
@@ -338,11 +402,26 @@ final class GestureRecognizer: @unchecked Sendable {
     /// Clear all state back to idle without emitting any action. The engine calls this
     /// before `start()` so a restart never resumes a stale phase left by a run that
     /// stopped mid-gesture; it is safe because frame delivery is not yet enabled when
-    /// the engine calls it.
+    /// the engine calls it. Also drops the tap quarantine: a fresh stream's timestamp
+    /// domain may differ, so a stale deadline could quarantine forever (or not at all).
     func resetState() {
+        clearGesture()
+        quarantineUntil = 0
+    }
+
+    /// End the current gesture (back to idle) without emitting any action. The tap
+    /// quarantine deliberately survives — the sites that set it do so right before
+    /// calling this.
+    private func reset() {
+        clearGesture()
+        onGestureActiveChanged?(false)
+    }
+
+    private func clearGesture() {
         phase = .idle
         anchorX = 0
         anchorY = 0
+        anchorSpread = 0
         startTime = 0
         frameCount = 0
         lastValidCount = 0
@@ -350,11 +429,6 @@ final class GestureRecognizer: @unchecked Sendable {
         swipeStartTime = 0
         lastTimestamp = 0
         lowFrameCount = 0
-    }
-
-    private func reset() {
-        resetState()
-        onGestureActiveChanged?(false)
     }
 
     /// A contact is a palm if it's too large, or — only while a gesture is just
