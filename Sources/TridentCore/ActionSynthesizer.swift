@@ -34,6 +34,14 @@ final class ActionSynthesizer: @unchecked Sendable {
     /// Whether ⌘ is currently held. Touched only on `eventQueue`.
     private var commandHeld = false
 
+    /// Closed by `releaseAllAndWait()` on engine stop, reopened by `prepare()` on the
+    /// next start. `monitor.stop()` prevents *future* frames, but a callback already
+    /// past its enabled-check can still be mid-flight on the framework thread and
+    /// enqueue an action *after* the teardown drain — on app quit, a `.swipeBegin`
+    /// landing there would press ⌘ with nothing left to ever release it. With the
+    /// gate closed such stragglers are no-ops. Touched only on `eventQueue`.
+    private var stopped = false
+
     // Watchdog: a held ⌘ must never wedge the keyboard. While ⌘ is down we expect a
     // steady touch-frame stream (the gesture is alive — even just resting fingers).
     // If frames stop arriving — a Bluetooth trackpad drops, the device disconnects,
@@ -78,22 +86,30 @@ final class ActionSynthesizer: @unchecked Sendable {
         eventQueue.async { [weak self] in self?.perform(action) }
     }
 
-    /// Release ⌘ if it is held. Call on engine stop so ⌘ can never get stuck.
-    func releaseAll() {
-        eventQueue.async { [weak self] in self?.releaseCommand() }
+    /// Reopen the gate closed by `releaseAllAndWait()`. The engine calls this on start,
+    /// before frame delivery is enabled; queued ahead of any possible action on the
+    /// same serial queue, so the new run's first action can't be dropped.
+    func prepare() {
+        eventQueue.async { [weak self] in self?.stopped = false }
     }
 
     /// Release ⌘ and block until the key-up has posted. Used on engine teardown: a serial
     /// `sync` runs after every action already queued (so a release can't race ahead of an
     /// in-flight `.swipeBegin`), and being synchronous guarantees the key-up reaches the
     /// system before the process can exit — so app termination can't leave ⌘ stuck.
+    /// Also closes the gate, so an action a still-mid-flight frame enqueues *after* this
+    /// drain is a no-op instead of re-pressing ⌘ behind the final release.
     func releaseAllAndWait() {
-        eventQueue.sync { releaseCommand() }
+        eventQueue.sync {
+            stopped = true
+            releaseCommand()
+        }
     }
 
     // MARK: - eventQueue only
 
     private func perform(_ action: GestureAction) {
+        guard !stopped else { return }
         switch action {
         case .middleClick:
             postMiddleClick()
@@ -112,7 +128,12 @@ final class ActionSynthesizer: @unchecked Sendable {
         // Don't fire a click while the switcher is open (shouldn't happen, but
         // keeps the two paths from colliding).
         guard !commandHeld else { return }
-        let location = CGEvent(source: nil)?.location ?? .zero
+        // No fallback location: a failed cursor read defaulting to .zero would land the
+        // click at the top-left screen corner (the Apple menu) instead of under the cursor.
+        guard let location = CGEvent(source: nil)?.location else {
+            log.error("middle click skipped: cursor location unavailable")
+            return
+        }
         postMouse(.otherMouseDown, at: location)
         usleep(10_000)  // 10 ms so the down/up register as a discrete click
         postMouse(.otherMouseUp, at: location)

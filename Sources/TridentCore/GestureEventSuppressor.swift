@@ -36,6 +36,13 @@ private nonisolated(unsafe) var gLastFrameTime: CFTimeInterval = 0
 /// framework callback (hot) thread.
 private nonisolated(unsafe) var gFrozen = CGPoint.zero
 private nonisolated(unsafe) var gFrozenValid = false
+/// Whether the gesture currently (or just) active ever entered a swipe. Drives the
+/// tail length at gesture end: the long tails exist to absorb the left/right clicks
+/// macOS can synthesize from a sloppy *tap-like* lift, but fingers that have
+/// travelled (a swipe) don't qualify as a tap to the system — there a long tail only
+/// eats the user's own intentional click right after switching apps. Guarded by
+/// `gSuppressLock`.
+private nonisolated(unsafe) var gWasSwipe = false
 private nonisolated(unsafe) var gTap: CFMachPort?
 /// Whether the tap is currently enabled. The tap is enabled ONLY while a gesture needs
 /// suppression (plus a short tail), and disabled the rest of the time — so when the user
@@ -145,9 +152,13 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
         // uneven three-finger lift is recognized by the system well *after* the fingers
         // leave (tap-recognition delay), occasionally past the (shorter) left tail.
         return (clickActive || now < rightUntil) ? nil : Unmanaged.passUnretained(event)
-    default:  // left clicks
+    case .leftMouseDown, .leftMouseUp:
         // Swallow during the gesture and a short tail, so a sloppy lift can't leak a tap.
         return (clickActive || now < leftUntil) ? nil : Unmanaged.passUnretained(event)
+    default:
+        // Anything else in the mask (e.g. an otherMouseDragged outside a cursor freeze —
+        // a physical middle-button drag) is none of our business; pass it through.
+        return Unmanaged.passUnretained(event)
     }
 }
 
@@ -177,6 +188,10 @@ final class GestureEventSuppressor: @unchecked Sendable {
     /// uneven lift well after the fingers leave, occasionally past the left tail.
     private let tail: CFTimeInterval = 0.3
     private let rightTail: CFTimeInterval = 0.6
+    /// Tail after a gesture that swiped: fingers that travelled can't be recognized as a
+    /// tap by the system, so a stray synthesized click is unlikely — and a user often
+    /// clicks deliberately right after switching apps. Keep just enough to cover the lift.
+    private let swipeTail: CFTimeInterval = 0.1
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -269,6 +284,7 @@ final class GestureEventSuppressor: @unchecked Sendable {
         gClickActive = false
         gCursorFreeze = false
         gFrozenValid = false
+        gWasSwipe = false
         gSuppressLeftUntil = 0
         gSuppressRightUntil = 0
         gTapEnabled = false
@@ -307,10 +323,13 @@ final class GestureEventSuppressor: @unchecked Sendable {
     func setGestureActive(_ active: Bool) {
         os_unfair_lock_lock(&gSuppressLock)
         gClickActive = active
-        if !active {
+        if active {
+            gWasSwipe = false   // a fresh gesture starts tap-like; setCursorFreeze marks a swipe
+        } else {
             let now = CACurrentMediaTime()
-            gSuppressLeftUntil = now + tail
-            gSuppressRightUntil = now + rightTail
+            // Swipes get a much shorter tail than tap-like gestures (see gWasSwipe).
+            gSuppressLeftUntil = now + (gWasSwipe ? swipeTail : tail)
+            gSuppressRightUntil = now + (gWasSwipe ? swipeTail : rightTail)
         }
         os_unfair_lock_unlock(&gSuppressLock)
         if active { enableTap() }   // ensure the tap is live for the duration of the gesture
@@ -322,7 +341,10 @@ final class GestureEventSuppressor: @unchecked Sendable {
     func setCursorFreeze(_ active: Bool) {
         os_unfair_lock_lock(&gSuppressLock)
         gCursorFreeze = active
-        if active { gFrozenValid = false }  // re-capture for this swipe
+        if active {
+            gFrozenValid = false  // re-capture for this swipe
+            gWasSwipe = true      // this gesture swiped → short tail at gesture end
+        }
         os_unfair_lock_unlock(&gSuppressLock)
         if active { enableTap() }
     }

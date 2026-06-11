@@ -250,6 +250,32 @@ final class GestureRecognizerTests: XCTestCase {
         XCTAssertEqual(changes, [true, false])
     }
 
+    /// Fingers left resting below three (e.g. a three-finger touch reduced to two) must
+    /// release the gesture-active latch once the tap window has passed — otherwise the
+    /// suppressor keeps eating every click system-wide for as long as the fingers rest.
+    func testRestingTwoFingersReleaseGestureAfterTapWindow() {
+        var changes: [Bool] = []
+        recognizer.onGestureActiveChanged = { changes.append($0) }
+        feed(threeFingers(centerX: 0.5), at: 0.00)                       // active true
+        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.05)         // dip — keep waiting
+        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.10)         // still inside tap window
+        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.20)         // window passed → release
+        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 1.00)         // resting on — stays released
+        XCTAssertEqual(changes, [true, false])
+        XCTAssertEqual(actions, [])
+    }
+
+    /// After that release, a returning third finger arms a fresh gesture — nothing is
+    /// lost by ending the dangling one.
+    func testThirdFingerReturningAfterReleaseStartsFreshGesture() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed([contact(0.28, 0.5), contact(0.32, 0.5)], at: 0.20)          // dangling → released
+        feed(threeFingers(centerX: 0.30), at: 0.30)                       // re-armed from idle
+        feed(threeFingers(centerX: 0.46), at: 0.32)                       // swipes normally
+        feed([], at: 0.36)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
+    }
+
     // MARK: - Per-feature toggles
 
     func testMiddleClickDisabledSuppressesTap() {

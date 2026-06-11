@@ -257,7 +257,15 @@ final class GestureRecognizer: @unchecked Sendable {
                 movedTooFar = true
             }
         }
-        // valid == 1 or 2: a transitional lift — keep waiting.
+        // valid == 1 or 2: a transitional lift — wait, but only inside the tap window.
+        // Beyond it nothing pending can fire (a tap is already too old, and a swipe
+        // needs three fingers back — which re-arms just as well from idle), while the
+        // gesture-active latch keeps the suppressor eating every click system-wide.
+        // Without this bound, two fingers left resting after a three-finger touch
+        // suppressed all clicks indefinitely.
+        if valid < 3, timestamp - startTime > tapMaxDuration {
+            reset()
+        }
     }
 
     private func enterSwiping(cx: Float, cy: Float, timestamp: Double) {

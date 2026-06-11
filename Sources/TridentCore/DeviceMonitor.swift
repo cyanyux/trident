@@ -156,6 +156,24 @@ final class DeviceMonitor: @unchecked Sendable {
         return true
     }
 
+    /// Whether the set of attached multitouch devices no longer matches what this
+    /// monitor registered — a trackpad connected or dropped since `start()` (Trident
+    /// would otherwise never read a Magic Trackpad that arrives after launch, or one
+    /// that reconnects after a Bluetooth drop). Count-based: enumeration may hand out
+    /// different wrapper pointers for the same hardware, so pointer identity can't be
+    /// compared across calls. The caller reconciles by restarting the engine.
+    func deviceListChanged() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard isRunning else { return false }
+        guard let list = MTDeviceCreateList() else { return false }
+        let count = CFArrayGetCount(list)
+        // An empty list is indistinguishable from a transient enumeration failure
+        // (start() falls back to the default device in that state) — don't flap.
+        guard count > 0 else { return false }
+        return count != registeredDevices.count
+    }
+
     /// Stop and unregister all devices. Safe to call repeatedly. `deviceSizes` is
     /// intentionally left intact (rebuilt on the next `start()`) so an in-flight
     /// callback can keep reading it without a lock.

@@ -61,7 +61,10 @@ public final class TridentEngine: @unchecked Sendable {
     @discardableResult
     public func start() -> Bool {
         // A previous run may have stopped mid-gesture; clear any stale phase before
-        // frames start flowing again.
+        // frames start flowing again. Re-arming the synthesizer first (its queue is
+        // serial) guarantees no action from the new run can land behind the gate that
+        // stop() closed.
+        synthesizer.prepare()
         recognizer.resetState()
         let started = monitor.start()
         suppressor.start()
@@ -83,6 +86,12 @@ public final class TridentEngine: @unchecked Sendable {
         // before `monitor.stop()` took hold, so the release is the last word.
         synthesizer.releaseAllAndWait()
         suppressor.stop()
+    }
+
+    /// Whether the set of attached trackpads differs from what the engine is reading
+    /// (one connected or dropped since `start()`). Reconcile by restarting the engine.
+    public func deviceListChanged() -> Bool {
+        monitor.deviceListChanged()
     }
 
     /// Horizontal travel, in millimetres, required per app-switch step. Physical
