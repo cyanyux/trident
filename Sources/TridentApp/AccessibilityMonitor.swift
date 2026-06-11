@@ -30,20 +30,40 @@ enum AccessibilityMonitor {
 
     /// Live TCC probe: can we create an Accessibility-gated event tap this instant? Returns
     /// `false` once permission is actually revoked, even while `AXIsProcessTrusted()` still lies.
+    ///
+    /// The probe must be **inert**: `tapCreate` returns the tap ENABLED, and between the
+    /// WindowServer registering it and processing our disable/invalidate there is a window in
+    /// which any event matching its mask is routed to a synchronous tap nobody services — the
+    /// WindowServer stalls that event until the tap timeout. Masked on `leftMouseDown` (the
+    /// old probe), running every poll tick, that window occasionally ate a real click and hung
+    /// input for up to a second. So the probe masks only `.null` — an event type that never
+    /// flows through the session stream — making it unhittable while keeping the gate: the
+    /// Accessibility check on an active tap happens at creation and is independent of the mask
+    /// (verified: with permission missing, `tapCreate` returns nil for a `.null`-mask
+    /// `.defaultTap` exactly as it does for a `leftMouseDown` one).
     private static func canCreateTap() -> Bool {
+        if createAndDropProbe(mask: CGEventMask(1) << CGEventMask(CGEventType.null.rawValue)) {
+            return true
+        }
+        // nil is almost certainly "permission revoked", but guard the one untestable corner —
+        // some future OS rejecting the never-firing mask outright — by confirming with the
+        // old real-event mask. Untrusted, this creates no tap (tapCreate returns nil), so the
+        // fallback never puts a hittable tap in the input path unless the inert probe is
+        // genuinely unavailable.
+        return createAndDropProbe(mask: CGEventMask(1) << CGEventMask(CGEventType.leftMouseDown.rawValue))
+    }
+
+    private static func createAndDropProbe(mask: CGEventMask) -> Bool {
         let noop: CGEventTapCallBack = { _, _, event, _ in Unmanaged.passUnretained(event) }
-        let mask = CGEventMask(1) << CGEventMask(CGEventType.leftMouseDown.rawValue)
         guard let probe = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
+            place: .tailAppendEventTap,    // probe order is irrelevant; stay out of head position
             options: .defaultTap,          // active tap ⇒ gated on Accessibility (matches our real tap)
             eventsOfInterest: mask,
             callback: noop,
             userInfo: nil
         ) else { return false }
-        // tapCreate returns the tap ENABLED, and we never add it to a run loop — so disable it
-        // immediately (before an event could route to an unserviced tap) and drop it. It never
-        // actually filters anything.
+        // Never added to a run loop — disable immediately and drop it.
         CGEvent.tapEnable(tap: probe, enable: false)
         CFMachPortInvalidate(probe)
         return true
