@@ -151,6 +151,10 @@ scripts/
 appcast.xml            Sparkle update feed (served from the public repo)
 ```
 
+## License
+
+[MIT](LICENSE)
+
 ## Acknowledgments
 
 - [MiddleDrag](https://github.com/NullPointerDepressiveDisorder/MiddleDrag) — a
