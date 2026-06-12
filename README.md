@@ -102,6 +102,7 @@ downloads are hosted on this public repo's Releases.
 **One-time setup:**
 
 ```sh
+brew install create-dmg           # designed installer DMG (background, drag-to-Applications layout)
 ./scripts/setup-signing.sh        # stable "Trident Dev" code-sign identity
 ./scripts/setup-sparkle-keys.sh   # EdDSA update key → private in keychain, public in Info.plist
 .sparkle/bin/generate_keys -x sparkle_private_key.pem   # back up the private key somewhere safe (NOT git)

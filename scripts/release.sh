@@ -34,6 +34,7 @@ UPDATES="$DIST/updates"   # only the ZIP lives here — what generate_appcast sc
 
 # --- preflight -------------------------------------------------------------
 command -v gh >/dev/null 2>&1 || { echo "error: gh (GitHub CLI) not installed" >&2; exit 1; }
+command -v create-dmg >/dev/null 2>&1 || { echo "error: create-dmg not installed — brew install create-dmg" >&2; exit 1; }
 gh auth status >/dev/null 2>&1 || { echo "error: run 'gh auth login' first" >&2; exit 1; }
 if [ -n "$(git status --porcelain)" ]; then
   echo "error: working tree is not clean — commit or stash before releasing" >&2
@@ -73,11 +74,24 @@ DMG="$DIST/Trident-$VERSION.dmg"
 # ZIP: what Sparkle downloads to self-update. ditto preserves the bundle + signature.
 ditto -c -k --keepParent "$APP" "$ZIP"
 
-# DMG: friendly first-time install — drag Trident onto the Applications alias.
+# DMG: friendly first-time install — a designed window (branded background,
+# drag-to-Applications arrow, fixed layout) built with create-dmg. The icon
+# coordinates here must match the arrow baked into assets/dmg-background.tiff
+# (regenerate via scripts/render-dmg-background.sh if you move things).
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/Trident.app"
-ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname "Trident" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
+create-dmg \
+  --volname "Trident" \
+  --volicon "$APP/Contents/Resources/AppIcon.icns" \
+  --background assets/dmg-background.tiff \
+  --window-pos 200 160 \
+  --window-size 660 400 \
+  --icon-size 128 \
+  --text-size 13 \
+  --icon "Trident.app" 165 195 \
+  --hide-extension "Trident.app" \
+  --app-drop-link 495 195 \
+  "$DMG" "$STAGE"
 rm -rf "$STAGE"
 
 # --- appcast ---------------------------------------------------------------
@@ -92,7 +106,7 @@ echo "==> appcast.xml regenerated"
 
 # --- publish ---------------------------------------------------------------
 git add "$INFO" appcast.xml
-git commit -m "Release $VERSION (build $NEW_BUILD)"
+git commit -m "Release $VERSION"
 git tag "$TAG"
 
 # The publish phase touches REMOTE state in three network steps, any of which can
