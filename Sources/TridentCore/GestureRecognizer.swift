@@ -67,15 +67,26 @@ final class GestureRecognizer: @unchecked Sendable {
     /// Any centroid travel (mm) beyond this — that isn't a swipe — disqualifies the
     /// tap, so vertical three-finger swipes don't register as middle clicks.
     private let tapMoveCancelMM: Float = 3.0
-    /// Any change (mm) in the contacts' spread — mean distance from their centroid —
-    /// beyond this also disqualifies the tap. A pinch or spread (Launchpad / show
-    /// desktop: thumb + three fingers, with the thumb often palm-rejected at the rim)
-    /// moves the fingers symmetrically, so the *centroid* stays put while the fingers
-    /// converge or fan out — exactly the blind spot of the centroid-travel check that
-    /// made a quick Launchpad pinch fire a middle click. A real tap's spread is static.
-    /// Checked on 2-contact frames as well: converging fingertips merge into fewer
-    /// sensor contacts, so much of a pinch's travel happens *after* the count drops.
-    private let tapSpreadCancelMM: Float = 3.0
+    /// Any single touch path travelling more than this (mm) disqualifies the tap.
+    ///
+    /// Identity-based, anchored where each touch first lands and tracked by the
+    /// sensor's persistent `pathIndex` — for EVERY contact, palm-rejected ones
+    /// included. This is the load-bearing pinch/spread guard (Launchpad, show
+    /// desktop: thumb + three fingers), and it closes the two holes that survived
+    /// the earlier centroid- and spread-delta heuristics:
+    ///   • those were re-anchored on every contact-count change (different contact
+    ///     sets aren't comparable), and a pinch's count flickers constantly as
+    ///     fingertips merge — laundering all the motion evidence through re-anchors;
+    ///   • the palm filter hid the pinching thumb from the centroid entirely.
+    /// Per-path travel can't be laundered (the anchor never moves while the touch
+    /// lives) and the thumb's own travel counts. 4 mm sits above a firm tap's
+    /// landing skid but far below any pinch finger's travel.
+    private let tapPathTravelCancelMM: Float = 4.0
+    /// A path index absent longer than this many frames is a NEW touch when it
+    /// reappears (the framework recycles path slots): re-anchor it rather than
+    /// charging it with travel that spans two different touches. Short enough to
+    /// bridge a one-or-two-frame sensor dropout mid-pinch without re-anchoring.
+    private let pathGapFrames = 8
 
     /// After a gesture ends abnormally — 4+ fingers seen (a system gesture like
     /// Launchpad / show desktop / Mission Control), the sub-3 dwell bound, or a stalled
@@ -128,6 +139,16 @@ final class GestureRecognizer: @unchecked Sendable {
     }
     private let config = OSAllocatedUnfairLock(initialState: Config())
 
+    /// One compact line per ended 3-finger gesture (`log show --predicate 'subsystem ==
+    /// "com.trident.Trident"'`). Forensics for stray middle clicks: the pinch→tap leak
+    /// took three attempts to corner blind; this records exactly why each lift did or
+    /// didn't click, so the next report comes with data instead of guesses.
+    private let log = Logger(subsystem: "com.trident.Trident", category: "Recognizer")
+
+    init() {
+        pathAnchors.reserveCapacity(16)   // hot path never grows it
+    }
+
     /// Sink for recognized actions. Invoked on the callback thread.
     var onAction: ((GestureAction) -> Void)?
 
@@ -162,9 +183,20 @@ final class GestureRecognizer: @unchecked Sendable {
     private var phase: Phase = .idle
     private var anchorX: Float = 0
     private var anchorY: Float = 0
-    /// Contact spread (mm) at the anchor, compared against the live spread to catch
-    /// pinches/spreads whose centroid stays put (see `tapSpreadCancelMM`).
-    private var anchorSpread: Float = 0
+    /// Where each live touch path first landed (see `tapPathTravelCancelMM`).
+    /// A handful of entries at most — linear scans are free. The buffer's capacity is
+    /// reserved once; clears keep it, so the hot path never allocates.
+    private struct PathAnchor {
+        var id: Int32
+        var x: Float
+        var y: Float
+        var lastSeenFrame: Int
+    }
+    private var pathAnchors: [PathAnchor] = []
+    /// Monotone frame counter for `PathAnchor.lastSeenFrame` / `pathGapFrames`.
+    private var frameIndex = 0
+    /// Largest per-path travel seen during the current gesture — forensics only.
+    private var gestureMaxTravel: Float = 0
     private var startTime: Double = 0
     private var frameCount: Int = 0
     private var lastValidCount: Int = 0
@@ -201,14 +233,23 @@ final class GestureRecognizer: @unchecked Sendable {
         // tracking, fingers are free to sweep toward an edge without being dropped.
         let entering = phase == .idle
 
-        // Centroid of valid (non-palm) contacts — a tight, allocation-free loop.
+        // One pass: centroid of valid (non-palm) contacts, plus per-path travel for
+        // EVERY contact — palm-rejected ones included, so a pinching thumb the palm
+        // filter hides still disqualifies a tap. Tight and allocation-free.
+        frameIndex &+= 1
         var sumX: Float = 0
         var sumY: Float = 0
         var valid = 0
+        var anyContact = false
+        var maxPathTravelMM: Float = 0
         for i in 0..<count {
             let t = touches[i]
             guard TouchState.isContact(t.state) else { continue }
+            anyContact = true
             let p = t.normalizedVector.position
+            let travel = notePathTravel(id: t.pathIndex, position: p,
+                                        widthMM: widthMM, heightMM: heightMM)
+            if travel > maxPathTravelMM { maxPathTravelMM = travel }
             if isPalm(position: p, size: t.zTotal, edgeBandMM: cfg.palmEdgeBandMM,
                       maxSize: cfg.palmMaxSize, widthMM: widthMM, heightMM: heightMM,
                       applyEdgeBand: entering) {
@@ -218,39 +259,22 @@ final class GestureRecognizer: @unchecked Sendable {
             sumY += p.y
             valid += 1
         }
+        // All touches gone: the next landing is a new story — drop the path anchors.
+        // (Keeps capacity, so this never allocates on re-fill.)
+        if !anyContact { pathAnchors.removeAll(keepingCapacity: true) }
         let cx = valid > 0 ? sumX / Float(valid) : 0
         let cy = valid > 0 ? sumY / Float(valid) : 0
-
-        // Mean contact distance from the centroid, in mm — the "spread". A second pass
-        // with the same contact/palm filter as above; a frame holds at most a handful
-        // of touches, so this stays allocation-free and cheap.
-        var spreadMM: Float = 0
-        if valid > 0 {
-            var sumDist: Float = 0
-            for i in 0..<count {
-                let t = touches[i]
-                guard TouchState.isContact(t.state) else { continue }
-                let p = t.normalizedVector.position
-                if isPalm(position: p, size: t.zTotal, edgeBandMM: cfg.palmEdgeBandMM,
-                          maxSize: cfg.palmMaxSize, widthMM: widthMM, heightMM: heightMM,
-                          applyEdgeBand: entering) {
-                    continue
-                }
-                sumDist += hypotf((p.x - cx) * widthMM, (p.y - cy) * heightMM)
-            }
-            spreadMM = sumDist / Float(valid)
-        }
 
         switch phase {
         case .idle:
             // Only arm a gesture when at least one mapping can actually fire; otherwise
             // three fingers would needlessly drive the click suppressor for no benefit.
             if valid == 3, cfg.middleClickEnabled || cfg.appSwitchEnabled {
-                beginTracking(cx: cx, cy: cy, spreadMM: spreadMM, timestamp: timestamp)
+                beginTracking(cx: cx, cy: cy, maxPathTravelMM: maxPathTravelMM, timestamp: timestamp)
             }
         case .tracking:
-            handleTracking(valid: valid, cx: cx, cy: cy, spreadMM: spreadMM, timestamp: timestamp,
-                           config: cfg, widthMM: widthMM, heightMM: heightMM)
+            handleTracking(valid: valid, cx: cx, cy: cy, maxPathTravelMM: maxPathTravelMM,
+                           timestamp: timestamp, config: cfg, widthMM: widthMM, heightMM: heightMM)
         case .swiping:
             handleSwiping(valid: valid, cx: cx, cy: cy, timestamp: timestamp,
                           distanceMM: cfg.swipeDistanceMM, widthMM: widthMM, heightMM: heightMM)
@@ -260,21 +284,41 @@ final class GestureRecognizer: @unchecked Sendable {
 
     // MARK: Phases
 
-    private func beginTracking(cx: Float, cy: Float, spreadMM: Float, timestamp: Double) {
+    /// Look up (or anchor) a touch path and return how far it has travelled, in mm,
+    /// since it first landed. A path slot unseen for more than `pathGapFrames` is a
+    /// recycled index — a new touch — and is re-anchored at zero travel.
+    private func notePathTravel(id: Int32, position p: MTPoint,
+                                widthMM: Float, heightMM: Float) -> Float {
+        for i in pathAnchors.indices where pathAnchors[i].id == id {
+            if frameIndex - pathAnchors[i].lastSeenFrame > pathGapFrames {
+                pathAnchors[i] = PathAnchor(id: id, x: p.x, y: p.y, lastSeenFrame: frameIndex)
+                return 0
+            }
+            pathAnchors[i].lastSeenFrame = frameIndex
+            return hypotf((p.x - pathAnchors[i].x) * widthMM,
+                          (p.y - pathAnchors[i].y) * heightMM)
+        }
+        pathAnchors.append(PathAnchor(id: id, x: p.x, y: p.y, lastSeenFrame: frameIndex))
+        return 0
+    }
+
+    private func beginTracking(cx: Float, cy: Float, maxPathTravelMM: Float, timestamp: Double) {
         phase = .tracking
         anchorX = cx
         anchorY = cy
-        anchorSpread = spreadMM
         startTime = timestamp
         frameCount = 1
-        // Born inside the quarantine window (the flickering tail of a system gesture)
-        // → tap-disqualified from the start. Swipes don't consult this flag.
-        movedTooFar = timestamp < quarantineUntil
+        gestureMaxTravel = maxPathTravelMM
+        // Born inside the quarantine window (the flickering tail of a system gesture),
+        // or from touches that have already travelled (a pinch mid-flight whose thumb
+        // just slid into the palm filter's edge band) → tap-disqualified from the
+        // start. Swipes don't consult this flag.
+        movedTooFar = timestamp < quarantineUntil || maxPathTravelMM > tapPathTravelCancelMM
         onGestureActiveChanged?(true)
     }
 
-    private func handleTracking(valid: Int, cx: Float, cy: Float, spreadMM: Float, timestamp: Double,
-                                config: Config, widthMM: Float, heightMM: Float) {
+    private func handleTracking(valid: Int, cx: Float, cy: Float, maxPathTravelMM: Float,
+                                timestamp: Double, config: Config, widthMM: Float, heightMM: Float) {
         if valid >= 4 {
             // 4+ fingers belong to the system (Mission Control, Launchpad, show
             // desktop). Quarantine the re-arm: those gestures' tails flicker through
@@ -286,20 +330,29 @@ final class GestureRecognizer: @unchecked Sendable {
         if valid == 0 {
             // All fingers lifted: fire a middle click if this was a clean tap.
             let elapsed = timestamp - startTime
-            if config.middleClickEnabled, !movedTooFar, frameCount >= tapMinFrames,
-               elapsed >= tapMinDuration, elapsed <= tapMaxDuration {
-                onAction?(.middleClick)
-            }
+            let tap = config.middleClickEnabled && !movedTooFar && frameCount >= tapMinFrames
+                && elapsed >= tapMinDuration && elapsed <= tapMaxDuration
+            if tap { onAction?(.middleClick) }
+            log.notice("""
+                gesture end: tap=\(tap) elapsed=\(elapsed, format: .fixed(precision: 3))s \
+                frames=\(self.frameCount) moved=\(self.movedTooFar) \
+                maxPathTravel=\(self.gestureMaxTravel, format: .fixed(precision: 1))mm
+                """)
             reset()
             return
         }
+        // Identity-based tap guard, independent of contact-count bookkeeping: a path
+        // that has travelled was not tapping, no matter how the count flickered.
+        if maxPathTravelMM > gestureMaxTravel { gestureMaxTravel = maxPathTravelMM }
+        if maxPathTravelMM > tapPathTravelCancelMM {
+            movedTooFar = true
+        }
         if valid != lastValidCount {
             // Contact count changed (a dip, a re-acquired finger, or fingertips
-            // merging mid-pinch) — re-anchor so the centroid/spread jump between
-            // different contact sets doesn't read as motion.
+            // merging mid-pinch) — re-anchor so the centroid jump between different
+            // contact sets doesn't read as travel.
             anchorX = cx
             anchorY = cy
-            anchorSpread = spreadMM
         } else {
             if valid == 3 { frameCount += 1 }
             let dxMM = (cx - anchorX) * widthMM
@@ -310,13 +363,8 @@ final class GestureRecognizer: @unchecked Sendable {
                 enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
                 return
             }
-            if hypotf(dxMM, dyMM) > tapMoveCancelMM
-                || abs(spreadMM - anchorSpread) > tapSpreadCancelMM {
-                // Centroid travel that isn't a swipe — or converging/fanning fingers
-                // (a Launchpad pinch / show-desktop spread whose thumb was palm-
-                // rejected). Checked at two contacts too: a pinch's fingertips merge,
-                // so much of its travel shows up after the count drops below three.
-                movedTooFar = true
+            if hypotf(dxMM, dyMM) > tapMoveCancelMM {
+                movedTooFar = true   // centroid travel that isn't a swipe — not a tap
             }
         }
         // Below three contacts, wait only inside the tap window. Beyond it nothing
@@ -407,6 +455,8 @@ final class GestureRecognizer: @unchecked Sendable {
     func resetState() {
         clearGesture()
         quarantineUntil = 0
+        pathAnchors.removeAll(keepingCapacity: true)
+        frameIndex = 0
     }
 
     /// End the current gesture (back to idle) without emitting any action. The tap
@@ -417,11 +467,14 @@ final class GestureRecognizer: @unchecked Sendable {
         onGestureActiveChanged?(false)
     }
 
+    /// Per-gesture state only. `pathAnchors` deliberately survives: while touches
+    /// remain on the surface, the tail of an aborted system gesture keeps carrying
+    /// its accumulated travel into any re-armed gesture. The anchors clear when all
+    /// contacts lift (see `process`) or on `resetState()`.
     private func clearGesture() {
         phase = .idle
         anchorX = 0
         anchorY = 0
-        anchorSpread = 0
         startTime = 0
         frameCount = 0
         lastValidCount = 0

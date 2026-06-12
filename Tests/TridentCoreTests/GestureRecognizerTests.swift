@@ -26,9 +26,11 @@ final class GestureRecognizerTests: XCTestCase {
     // MARK: - Helpers
 
     /// A single active contact at a normalized position (size below the palm cutoff).
-    private func contact(_ x: Float, _ y: Float) -> MTTouch {
+    /// `path` is the sensor's persistent per-touch identity — frames describing the
+    /// same physical finger across time must reuse the same path, like the hardware.
+    private func contact(_ x: Float, _ y: Float, path: Int32 = 0) -> MTTouch {
         MTTouch(
-            frame: 0, timestamp: 0, pathIndex: 0, state: TouchState.active,
+            frame: 0, timestamp: 0, pathIndex: path, state: TouchState.active,
             fingerID: 0, handID: 0,
             normalizedVector: MTVector(position: MTPoint(x: x, y: y), velocity: MTPoint(x: 0, y: 0)),
             zTotal: 1.0, field9: 0, angle: 0, majorAxis: 0, minorAxis: 0,
@@ -38,8 +40,11 @@ final class GestureRecognizerTests: XCTestCase {
     }
 
     /// Three contacts whose centroid is (`centerX`, `centerY`), all clear of the edges.
+    /// Paths 0/1/2 left-to-right, consistently across frames.
     private func threeFingers(centerX: Float, centerY: Float = 0.5) -> [MTTouch] {
-        [contact(centerX - 0.03, centerY), contact(centerX, centerY), contact(centerX + 0.03, centerY)]
+        [contact(centerX - 0.03, centerY, path: 0),
+         contact(centerX, centerY, path: 1),
+         contact(centerX + 0.03, centerY, path: 2)]
     }
 
     /// Feed one frame. An empty frame still passes a valid pointer with count 0.
@@ -71,7 +76,7 @@ final class GestureRecognizerTests: XCTestCase {
     func testStaggeredLiftStillMiddleClicks() {
         feed(threeFingers(centerX: 0.5), at: 0.00)                       // begin
         feed(threeFingers(centerX: 0.5), at: 0.04)                       // settle (2 frames)
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.06)         // one finger lifts
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 0.06)  // one finger lifts
         feed([], at: 0.08)                                                // last fingers lift → click
         XCTAssertEqual(actions, [.middleClick])
     }
@@ -81,16 +86,16 @@ final class GestureRecognizerTests: XCTestCase {
     /// blind spot of the centroid-travel check. The spread change must disqualify the
     /// tap, or launching Launchpad fires a stray middle click.
     func testThumbRejectedPinchDoesNotMiddleClick() {
-        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.00)
-        feed([contact(0.46, 0.5), contact(0.50, 0.5), contact(0.54, 0.5)], at: 0.05)  // converging
+        feed([contact(0.40, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.60, 0.5, path: 2)], at: 0.00)
+        feed([contact(0.46, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.54, 0.5, path: 2)], at: 0.05)  // converging
         feed([], at: 0.08)                                                            // quick lift
         XCTAssertEqual(actions, [])
     }
 
     /// Same for show desktop: fingers fanning out around a stationary centroid.
     func testThumbRejectedSpreadDoesNotMiddleClick() {
-        feed([contact(0.45, 0.5), contact(0.50, 0.5), contact(0.55, 0.5)], at: 0.00)
-        feed([contact(0.38, 0.5), contact(0.50, 0.5), contact(0.62, 0.5)], at: 0.05)  // fanning out
+        feed([contact(0.45, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.55, 0.5, path: 2)], at: 0.00)
+        feed([contact(0.38, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.62, 0.5, path: 2)], at: 0.05)  // fanning out
         feed([], at: 0.08)
         XCTAssertEqual(actions, [])
     }
@@ -98,10 +103,10 @@ final class GestureRecognizerTests: XCTestCase {
     /// Mid-pinch, converging fingertips merge into fewer sensor contacts — much of the
     /// travel shows up at *two* contacts. The spread check must keep watching there.
     func testPinchConvergingAtTwoContactsDoesNotMiddleClick() {
-        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.00)
-        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.02)
-        feed([contact(0.44, 0.5), contact(0.56, 0.5)], at: 0.04)   // two fingers merged
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.06)   // still converging
+        feed([contact(0.40, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.60, 0.5, path: 2)], at: 0.00)
+        feed([contact(0.40, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.60, 0.5, path: 2)], at: 0.02)
+        feed([contact(0.44, 0.5, path: 0), contact(0.56, 0.5, path: 2)], at: 0.04)   // two fingers merged
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 0.06)   // still converging
         feed([], at: 0.08)
         XCTAssertEqual(actions, [])
     }
@@ -111,7 +116,7 @@ final class GestureRecognizerTests: XCTestCase {
     /// post-4-finger quarantine must keep that flicker from opening a fresh tap window.
     func testThreeContactFlickerAfterFourFingersDoesNotMiddleClick() {
         feed(threeFingers(centerX: 0.5), at: 0.00)
-        feed([contact(0.35, 0.5), contact(0.45, 0.5), contact(0.55, 0.5), contact(0.65, 0.35)], at: 0.03)
+        feed([contact(0.35, 0.5, path: 0), contact(0.45, 0.5, path: 1), contact(0.55, 0.5, path: 2), contact(0.65, 0.35, path: 3)], at: 0.03)
         feed(threeFingers(centerX: 0.5), at: 0.05)   // tail flicker — re-arms quarantined
         feed(threeFingers(centerX: 0.5), at: 0.08)
         feed([], at: 0.10)                            // quick lift inside the tap window
@@ -122,10 +127,37 @@ final class GestureRecognizerTests: XCTestCase {
     /// enough to trip it, then flickers back to three on the way out.
     func testThreeContactFlickerAfterDwellResetDoesNotMiddleClick() {
         feed(threeFingers(centerX: 0.5), at: 0.00)
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.20)   // dwell past tap window
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 0.20)   // dwell past tap window
         feed(threeFingers(centerX: 0.5), at: 0.25)                  // tail flicker
         feed(threeFingers(centerX: 0.5), at: 0.28)
         feed([], at: 0.31)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Contact-count flicker must not launder pinch travel. The centroid (and the old
+    /// spread) checks re-anchor on every count change — necessary, since different
+    /// contact sets aren't comparable — so a pinch whose count alternates 3→2→3 shed
+    /// all its motion evidence and still clicked. Per-path travel is identity-based
+    /// and survives the flicker.
+    func testCountFlickerDoesNotLaunderPinchTravel() {
+        feed([contact(0.40, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.60, 0.5, path: 2)], at: 0.00)
+        feed([contact(0.40, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.60, 0.5, path: 2)], at: 0.02)
+        feed([contact(0.44, 0.5, path: 0), contact(0.56, 0.5, path: 2)], at: 0.04)   // dip while converging
+        feed([contact(0.46, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.54, 0.5, path: 2)], at: 0.06)
+        feed([], at: 0.08)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The pinching thumb itself — palm-rejected for size, so invisible to the
+    /// centroid — must still disqualify the tap by its own travel.
+    func testPalmRejectedMovingThumbCancelsTap() {
+        var thumb = contact(0.5, 0.2, path: 9)
+        thumb.zTotal = 3.0                            // over the size cap → palm-rejected
+        var thumbLater = contact(0.5, 0.4, path: 9)   // slid 20 mm
+        thumbLater.zTotal = 3.0
+        feed(threeFingers(centerX: 0.5) + [thumb], at: 0.00)
+        feed(threeFingers(centerX: 0.5) + [thumbLater], at: 0.05)
+        feed([], at: 0.08)
         XCTAssertEqual(actions, [])
     }
 
@@ -225,13 +257,13 @@ final class GestureRecognizerTests: XCTestCase {
     func testFourFingersCancelActiveSwipe() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
         feed(threeFingers(centerX: 0.46), at: 0.02)  // begin + step
-        feed([contact(0.2, 0.5), contact(0.4, 0.5), contact(0.6, 0.5), contact(0.8, 0.5)], at: 0.04)
+        feed([contact(0.2, 0.5, path: 0), contact(0.4, 0.5, path: 1), contact(0.6, 0.5, path: 2), contact(0.8, 0.5, path: 3)], at: 0.04)
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .cancel])
     }
 
     func testFourFingersInTrackingResetsSilently() {
         feed(threeFingers(centerX: 0.5), at: 0.00)
-        feed([contact(0.2, 0.5), contact(0.4, 0.5), contact(0.6, 0.5), contact(0.8, 0.5)], at: 0.02)
+        feed([contact(0.2, 0.5, path: 0), contact(0.4, 0.5, path: 1), contact(0.6, 0.5, path: 2), contact(0.8, 0.5, path: 3)], at: 0.02)
         feed([], at: 0.04)
         XCTAssertEqual(actions, [])
     }
@@ -275,9 +307,9 @@ final class GestureRecognizerTests: XCTestCase {
     func testTwoFingersDoNotStep() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
         feed(threeFingers(centerX: 0.46), at: 0.02)                  // begin + first step
-        feed([contact(0.50, 0.5), contact(0.56, 0.5)], at: 0.04)    // 2 fingers, moving — no step
-        feed([contact(0.66, 0.5), contact(0.72, 0.5)], at: 0.06)    // 2 fingers, moving — no step
-        feed([contact(0.82, 0.5), contact(0.88, 0.5)], at: 0.08)    // 2 fingers persist → commit
+        feed([contact(0.50, 0.5, path: 1), contact(0.56, 0.5, path: 2)], at: 0.04)    // 2 fingers, moving — no step
+        feed([contact(0.66, 0.5, path: 1), contact(0.72, 0.5, path: 2)], at: 0.06)    // 2 fingers, moving — no step
+        feed([contact(0.82, 0.5, path: 1), contact(0.88, 0.5, path: 2)], at: 0.08)    // 2 fingers persist → commit
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
 
@@ -286,7 +318,7 @@ final class GestureRecognizerTests: XCTestCase {
     func testTransientFingerDipDoesNotCommit() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
         feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + first step
-        feed([contact(0.50, 0.5)], at: 0.04)          // 1-frame dropout to one contact — absorbed
+        feed([contact(0.50, 0.5, path: 1)], at: 0.04)  // 1-frame dropout to one contact — absorbed
         feed(threeFingers(centerX: 0.62), at: 0.40)   // three back, HUD up → re-anchor, no phantom step
         feed(threeFingers(centerX: 0.80), at: 0.42)   // real travel → one more step
         feed([], at: 0.45)                            // lift → commit
@@ -321,10 +353,10 @@ final class GestureRecognizerTests: XCTestCase {
         var changes: [Bool] = []
         recognizer.onGestureActiveChanged = { changes.append($0) }
         feed(threeFingers(centerX: 0.5), at: 0.00)                       // active true
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.05)         // dip — keep waiting
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.10)         // still inside tap window
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 0.20)         // window passed → release
-        feed([contact(0.48, 0.5), contact(0.52, 0.5)], at: 1.00)         // resting on — stays released
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 0.05)  // dip — keep waiting
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 0.10)  // still inside tap window
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 0.20)  // window passed → release
+        feed([contact(0.48, 0.5, path: 0), contact(0.52, 0.5, path: 2)], at: 1.00)  // resting on — stays released
         XCTAssertEqual(changes, [true, false])
         XCTAssertEqual(actions, [])
     }
@@ -333,7 +365,7 @@ final class GestureRecognizerTests: XCTestCase {
     /// lost by ending the dangling one.
     func testThirdFingerReturningAfterReleaseStartsFreshGesture() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed([contact(0.28, 0.5), contact(0.32, 0.5)], at: 0.20)          // dangling → released
+        feed([contact(0.28, 0.5, path: 0), contact(0.32, 0.5, path: 2)], at: 0.20)  // dangling → released
         feed(threeFingers(centerX: 0.30), at: 0.30)                       // re-armed from idle
         feed(threeFingers(centerX: 0.46), at: 0.32)                       // swipes normally
         feed([], at: 0.36)
@@ -387,7 +419,7 @@ final class GestureRecognizerTests: XCTestCase {
     /// 11 mm band but outside the 'Standard' 7 mm band, so the two levels diverge.
     /// The other two are well clear of every band.
     private func nearEdgeThreeFingers() -> [MTTouch] {
-        [contact(0.08, 0.5), contact(0.5, 0.5), contact(0.85, 0.5)]
+        [contact(0.08, 0.5, path: 0), contact(0.5, 0.5, path: 1), contact(0.85, 0.5, path: 2)]
     }
 
     func testStrongPalmRejectionDropsEdgeContact() {
@@ -411,17 +443,17 @@ final class GestureRecognizerTests: XCTestCase {
     /// rightward swipe would drop its leading finger, jump the centroid, and stall.
     func testFingerSweepingIntoEdgeBandMidSwipeStillSteps() {
         recognizer.setPalmRejection(edgeBandMM: 5, maxSize: 1.5)
-        feed([contact(0.40, 0.5), contact(0.50, 0.5), contact(0.60, 0.5)], at: 0.00)  // clean start
+        feed([contact(0.40, 0.5, path: 0), contact(0.50, 0.5, path: 1), contact(0.60, 0.5, path: 2)], at: 0.00)  // clean start
         // Sweep right until the leading finger is inside the 0.95 edge band.
-        feed([contact(0.78, 0.5), contact(0.88, 0.5), contact(0.98, 0.5)], at: 0.02)
+        feed([contact(0.78, 0.5, path: 0), contact(0.88, 0.5, path: 1), contact(0.98, 0.5, path: 2)], at: 0.02)
         feed([], at: 0.06)
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
 
     func testOversizedContactRejectedAsPalm() {
-        var palm = contact(0.5, 0.5)
+        var palm = contact(0.5, 0.5, path: 2)
         palm.zTotal = 3.0                         // bigger than any level's cap
-        let frame = [contact(0.4, 0.5), contact(0.6, 0.5), palm]
+        let frame = [contact(0.4, 0.5, path: 0), contact(0.6, 0.5, path: 1), palm]
         feed(frame, at: 0.00)                      // palm dropped → only 2 valid
         feed(frame, at: 0.05)
         feed([], at: 0.08)
