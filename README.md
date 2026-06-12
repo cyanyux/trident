@@ -7,7 +7,10 @@ A macOS menu-bar utility that remaps trackpad gestures:
 
 A quick swipe switches to the adjacent app instantly; leaving your fingers resting
 keeps the app-switcher HUD up so you can scrub through several apps, then lift to
-commit. Trident lives in the menu bar — no Dock icon, no window to manage.
+commit.
+
+**Use one or both.** Each gesture has its own on/off switch, and swipe
+sensitivity and palm rejection are adjustable — see [Settings](#settings).
 
 ## Install
 
@@ -30,6 +33,19 @@ commit. Trident lives in the menu bar — no Dock icon, no window to manage.
 offers to install them; you can also trigger a check from the menu bar via
 **Check for Updates…**. Because every release keeps the same signing identity, your
 Accessibility grant carries across updates — no re-granting.
+
+## Settings
+
+Click the menu-bar icon — everything is configured there:
+
+- **Tap → Middle Click** / **Swipe → Switch App** — each gesture on or off, independently
+- **Swipe sensitivity** — finger travel per app-switch step; smaller is more sensitive
+- **Palm rejection** — ignores touches that start in a band (width adjustable) along
+  the **left, right, and bottom edges**, where palm heels and a resting thumb land;
+  oversized contacts are rejected anywhere on the pad
+- **Haptic Feedback** — a tap on each app-switch step
+- **Enable Trident** — master switch; plus **Launch at Login**, **Hide Menu Bar Icon**,
+  **Check for Updates**, and the **Setup Assistant**
 
 ## Requirements
 
