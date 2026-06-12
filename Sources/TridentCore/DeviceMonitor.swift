@@ -115,6 +115,17 @@ final class DeviceMonitor: @unchecked Sendable {
         var sizes: [(device: UnsafeMutableRawPointer, size: SurfaceSize)] = []
 
         func register(_ device: UnsafeMutableRawPointer) {
+            // Take one unbalanced retain on the handle, forever. The framework's
+            // per-device dequeue thread (mt_ThreadedMTEntry) drops its own reference
+            // when the device goes away (sleep/wake, disconnect); if that drop is the
+            // FINAL release, __MTDeviceRelease calls MTDeviceStop on the framework's
+            // thread — racing the stop in `stop()` and crashing on the dead mach port
+            // (observed in the field as SIGSEGV in CFMachPortGetPort and an
+            // over-release trap in CFRelease). With this extra reference the final
+            // release never happens, so the only MTDeviceStop is ours, serialized
+            // under `stateLock`. The wrapper is deliberately leaked: a few dozen
+            // bytes per device per engine restart.
+            _ = Unmanaged<AnyObject>.fromOpaque(device).retain()
             let size = physicalSize(of: device)
             sizes.append((device, size))
             let summary = String(format: "trackpad surface %.1f × %.1f mm", Double(size.widthMM), Double(size.heightMM))
@@ -125,10 +136,8 @@ final class DeviceMonitor: @unchecked Sendable {
         }
 
         // `MTDeviceCreateList` follows the Create rule; Swift ARC releases the returned
-        // CFArray when it leaves scope. The device handles inside belong to the
-        // framework and are intentionally never CFReleased — releasing a handle the
-        // framework has already torn down (across sleep or a disconnect) crashes inside
-        // CFRelease — so we only ever hold raw pointers to them.
+        // CFArray when it leaves scope. The device handles inside are retained once in
+        // `register` (see comment there) and never released.
         if let list = MTDeviceCreateList() {
             for i in 0..<CFArrayGetCount(list) {
                 guard let raw = CFArrayGetValueAtIndex(list, i) else { continue }
@@ -196,8 +205,9 @@ final class DeviceMonitor: @unchecked Sendable {
 
         for device in devices {
             MTUnregisterContactFrameCallback(device, contactCallback)
-            // Guard against a double-release if the framework already tore the
-            // handle down (e.g. across a sleep/wake or a disconnect).
+            // The handle memory is always valid here (retained in `register`), and the
+            // framework's release-time stop path never runs (same retain), so this is
+            // the sole MTDeviceStop. The running check just makes repeated stops inert.
             if MTDeviceIsRunning(device) {
                 MTDeviceStop(device)
             }
