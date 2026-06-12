@@ -3,6 +3,7 @@ Trident.xcodeproj/
 
 # Build output
 build/
+.build/
 DerivedData/
 
 # Sparkle CLI tools (downloaded on demand) and release artifacts
