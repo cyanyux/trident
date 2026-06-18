@@ -25,11 +25,12 @@ final class ActionSynthesizer: @unchecked Sendable {
     private let log = Logger(subsystem: "com.trident.Trident", category: "ActionSynthesizer")
     private let eventQueue = DispatchQueue(label: "com.trident.events", qos: .userInteractive)
 
-    // Keyboard chords combine with the session's modifier state so the switcher
-    // sees ⌘ as held; the mouse click stays on a private state to avoid disturbing
-    // real input.
-    private let keyboardSource = CGEventSource(stateID: .combinedSessionState)
-    private let mouseSource = CGEventSource(stateID: .privateState)
+    /// The event-posting seam — real CGEvents in production (`CGEventSink`), a recorder in tests.
+    private let sink: EventSink
+
+    /// Whether the stuck-⌘ watchdog timer runs. Always true in production; tests disable it and
+    /// drive recovery deterministically via `fireWatchdogForTesting()`.
+    private let watchdogEnabled: Bool
 
     /// Whether ⌘ is currently held. Touched only on `eventQueue`.
     private var commandHeld = false
@@ -94,17 +95,9 @@ final class ActionSynthesizer: @unchecked Sendable {
     /// against). A genuinely *dropped* Escape is the residual risk, which no settle fixes.
     private let cancelSettleMicros: UInt32 = 50_000
 
-    init() {
-        // The default local-events suppression interval (0.25 s) drops synthetic
-        // keystrokes posted in quick succession from the same source — exactly a fast
-        // HUD scrub (several ⌘Tab pairs inside 250 ms) — making it skip steps and land
-        // on the wrong app. Zero it so every step lands.
-        keyboardSource?.localEventsSuppressionInterval = 0
-        if keyboardSource == nil || mouseSource == nil {
-            // Events still post against the default source, but the tuning above is lost;
-            // surface it rather than failing silently.
-            log.error("CGEventSource creation failed; synthetic event tuning unavailable")
-        }
+    init(sink: EventSink = CGEventSink(), watchdogEnabled: Bool = true) {
+        self.sink = sink
+        self.watchdogEnabled = watchdogEnabled
     }
 
     /// Record that a touch frame arrived. Called per frame on the framework callback
@@ -116,6 +109,23 @@ final class ActionSynthesizer: @unchecked Sendable {
 
     func handle(_ action: GestureAction) {
         eventQueue.async { [weak self] in self?.perform(action) }
+    }
+
+    /// Test seam: block until every action queued on `eventQueue` has run, so a test can assert on
+    /// the injected `EventSink` synchronously. Never called in production.
+    func drainForTesting() {
+        eventQueue.sync {}
+    }
+
+    /// Test seam: run one watchdog tick synchronously (the timer is disabled under test). Lets a
+    /// test drive phase-based recovery deterministically instead of waiting on a 0.25 s timer.
+    func fireWatchdogForTesting() {
+        eventQueue.sync { watchdogTick() }
+    }
+
+    /// Test seam: read whether ⌘ is currently believed held, on the event queue.
+    var commandHeldForTesting: Bool {
+        eventQueue.sync { commandHeld }
     }
 
     /// Reopen the gate closed by `releaseAllAndWait()`. The engine calls this on start,
@@ -201,25 +211,13 @@ final class ActionSynthesizer: @unchecked Sendable {
         guard !commandHeld else { return }
         // No fallback location: a failed cursor read defaulting to .zero would land the
         // click at the top-left screen corner (the Apple menu) instead of under the cursor.
-        guard let location = CGEvent(source: nil)?.location else {
+        guard let location = sink.cursorLocation() else {
             log.error("middle click skipped: cursor location unavailable")
             return
         }
-        postMouse(.otherMouseDown, at: location)
+        sink.postMouse(.otherMouseDown, at: location)
         usleep(10_000)  // 10 ms so the down/up register as a discrete click
-        postMouse(.otherMouseUp, at: location)
-    }
-
-    private func postMouse(_ type: CGEventType, at location: CGPoint) {
-        guard let event = CGEvent(
-            mouseEventSource: mouseSource,
-            mouseType: type,
-            mouseCursorPosition: location,
-            mouseButton: .center
-        ) else { return }
-        event.setIntegerValueField(.mouseEventButtonNumber, value: 2)
-        event.flags = []
-        event.post(tap: .cghidEventTap)
+        sink.postMouse(.otherMouseUp, at: location)
     }
 
     private func pressCommand() {
@@ -268,16 +266,11 @@ final class ActionSynthesizer: @unchecked Sendable {
         log.notice("release ⌘ (posted=\(posted))")
     }
 
-    /// Post a single key event. Returns whether it was created and posted, so a caller
-    /// can keep its state in sync with what actually reached the system.
+    /// Post a single key event through the sink. Returns whether it was created and posted, so a
+    /// caller can keep its state in sync with what actually reached the system.
     @discardableResult
     private func postKey(_ key: CGKeyCode, flags: CGEventFlags, down: Bool) -> Bool {
-        guard let event = CGEvent(keyboardEventSource: keyboardSource, virtualKey: key, keyDown: down) else {
-            return false
-        }
-        event.flags = flags
-        event.post(tap: .cghidEventTap)
-        return true
+        sink.postKey(key, flags: flags, down: down)
     }
 
     /// Post a key down then up (a discrete keypress) carrying the given modifier flags. Returns
@@ -366,38 +359,43 @@ final class ActionSynthesizer: @unchecked Sendable {
     // MARK: - Watchdog (eventQueue only)
 
     private func startWatchdog() {
+        guard watchdogEnabled else { return }   // tests drive recovery via fireWatchdogForTesting()
         stopWatchdog()
         lastFrameTime.withLock { $0 = CACurrentMediaTime() }   // seed so a stale read can't fire instantly
         let timer = DispatchSource.makeTimerSource(queue: eventQueue)
         timer.schedule(deadline: .now() + watchdogInterval, repeating: watchdogInterval)
-        timer.setEventHandler { [weak self] in
-            guard let self, self.commandHeld else { return }
-            switch self.heldPhase {
-            case .inProgress:
-                // No terminal action yet, so the only safe trigger is a DEAD frame stream — the
-                // gesture's device slept / disconnected and the user can no longer end it. The frame
-                // gap matters here (a resting hold is alive). Cancel, never commit a stale highlight.
-                let last = self.lastFrameTime.withLock { $0 }
-                let gap = CACurrentMediaTime() - last
-                guard gap > self.staleFrameThreshold else { return }
-                self.log.error("frame stream stalled \(gap, format: .fixed(precision: 2))s mid-switch — cancelling held ⌘")
-                self.heldPhase = .cancelling
-                self.dismissAndRelease()
-            case .committing:
-                // `.swipeCommit` ran but its ⌘-up never posted (commandHeld still set). Retry it —
-                // frame-INDEPENDENT, because a commit may leave fingers resting (stream still alive),
-                // so a frame-gap gate could wait forever. Retrying as a commit never inverts it.
-                self.log.error("commit ⌘-up still pending — retrying release")
-                self.releaseCommand()
-            case .cancelling:
-                // A cancel ran but isn't complete. Retry; `dismissAndRelease` + `hudDismissed` re-post
-                // Escape only until it lands, then only the ⌘-up — no front-app ⌘-Escape spam.
-                self.log.error("cancel still pending — retrying dismiss/release")
-                self.dismissAndRelease()
-            }
-        }
+        timer.setEventHandler { [weak self] in self?.watchdogTick() }
         watchdog = timer
         timer.resume()
+    }
+
+    /// One watchdog evaluation: recover a stuck ⌘ according to its phase. Frame-gap-gated only for
+    /// `.inProgress` (a resting hold is alive); the terminal phases retry frame-independently.
+    private func watchdogTick() {
+        guard commandHeld else { return }
+        switch heldPhase {
+        case .inProgress:
+            // No terminal action yet, so the only safe trigger is a DEAD frame stream — the gesture's
+            // device slept / disconnected and the user can no longer end it. The frame gap matters
+            // here (a resting hold is alive). Cancel, never commit a stale highlight.
+            let last = lastFrameTime.withLock { $0 }
+            let gap = CACurrentMediaTime() - last
+            guard gap > staleFrameThreshold else { return }
+            log.error("frame stream stalled \(gap, format: .fixed(precision: 2))s mid-switch — cancelling held ⌘")
+            heldPhase = .cancelling
+            dismissAndRelease()
+        case .committing:
+            // `.swipeCommit` ran but its ⌘-up never posted (commandHeld still set). Retry it —
+            // frame-INDEPENDENT, because a commit may leave fingers resting (stream still alive), so
+            // a frame-gap gate could wait forever. Retrying as a commit never inverts it.
+            log.error("commit ⌘-up still pending — retrying release")
+            releaseCommand()
+        case .cancelling:
+            // A cancel ran but isn't complete. Retry; `dismissAndRelease` + `hudDismissed` re-post
+            // Escape only until it lands, then only the ⌘-up — no front-app ⌘-Escape spam.
+            log.error("cancel still pending — retrying dismiss/release")
+            dismissAndRelease()
+        }
     }
 
     private func stopWatchdog() {
