@@ -12,6 +12,10 @@ commit.
 **Use one or both.** Each gesture has its own on/off switch, and swipe
 sensitivity and palm rejection are adjustable — see [Settings](#settings).
 
+<p align="center">
+  <img src="assets/onboarding.png" alt="Trident welcome screen — Tap → Middle Click, Swipe → Switch App" width="640">
+</p>
+
 ## Install
 
 1. Download the latest **Trident.dmg** from the
@@ -37,6 +41,10 @@ Accessibility grant carries across updates — no re-granting.
 ## Settings
 
 Click the menu-bar icon — everything is configured there:
+
+<p align="center">
+  <img src="assets/menu.png" alt="Trident menu-bar settings panel" width="300">
+</p>
 
 - **Tap → Middle Click** / **Swipe → Switch App** — each gesture on or off, independently
 - **Swipe sensitivity** — finger travel per app-switch step; smaller is more sensitive
