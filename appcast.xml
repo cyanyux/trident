@@ -3,6 +3,15 @@
     <channel>
         <title>Trident</title>
         <item>
+            <title>1.0.2</title>
+            <pubDate>Fri, 26 Jun 2026 16:38:43 +0800</pubDate>
+            <link>https://github.com/cyanyux/trident</link>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>1.0.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/cyanyux/trident/releases/download/v1.0.2/Trident-1.0.2.zip" length="1560537" type="application/octet-stream" sparkle:edSignature="kJZxa51tYkgpUoyz1mQuZ8wMKO9KKclK9o8srOi0yJQb4ooVP4l/P/XJYTGY8/1FCP4B1NhAGWzpHrMX3LBfAQ=="/>
+        </item>
+        <item>
             <title>1.0.1</title>
             <pubDate>Thu, 18 Jun 2026 19:04:24 +0800</pubDate>
             <link>https://github.com/cyanyux/trident</link>
