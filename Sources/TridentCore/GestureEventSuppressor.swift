@@ -14,9 +14,11 @@ import os
 //   • Click suppression (`gClickActive` + the per-button tails): swallow the native
 //     left/right clicks macOS can synthesize from a sloppy three-finger tap, for the
 //     gesture plus a short tail. Active for the whole gesture (tracking included).
-//   • Cursor freeze (`gCursorFreeze`): pin the cursor while a *swipe* drives the ⌘Tab
-//     HUD, so the swipe's incidental nudge can't move the cursor onto the HUD (whose
-//     mouse-hover would otherwise hijack the selection). Active only during a swipe.
+//   • Cursor freeze (`gCursorFreeze`): while a *swipe* drives the ⌘Tab HUD, SWALLOW the
+//     cursor-motion events (return nil) so the HUD never gets the mouse-hover trigger that
+//     would otherwise hijack its selection to the app under the cursor. Active only during a
+//     swipe. (The cursor sprite still drifts a little — the OS moves it directly below this
+//     tap — but that is cosmetic; denying the HUD the motion event is what holds the selection.)
 //
 // Both self-heal: if a gesture's frame stream dies without a closing frame (sleep,
 // disconnect, Bluetooth drop), `gLastFrameTime` ages past `gStaleGap` and the idle
@@ -31,17 +33,6 @@ private nonisolated(unsafe) var gSuppressRightUntil: CFTimeInterval = 0
 /// Last time a touch frame arrived (`noteFrame`). Keeps the self-heal from firing during
 /// a live gesture (frames flowing) while letting a dead stream age out.
 private nonisolated(unsafe) var gLastFrameTime: CFTimeInterval = 0
-/// Where to pin the cursor during a swipe, captured lazily from the first cursor-motion
-/// event after the freeze begins — so there is no synchronous CG round-trip on the
-/// framework callback (hot) thread.
-///
-/// INVARIANT: `gFrozen` is MEANINGLESS unless `gFrozenValid` is true. It is not zeroed on
-/// freeze-off (only `gFrozenValid` flips false), so between swipes it holds the PRIOR swipe's
-/// stale point. Never read `gFrozen` without first checking `gFrozenValid` (and `gCursorFreeze`)
-/// under `gSuppressLock` — e.g. an async sprite-correction warp (see the .mouseMoved case's RULE D
-/// note) that read it unguarded would warp the cursor to a dead swipe's pin point.
-private nonisolated(unsafe) var gFrozen = CGPoint.zero
-private nonisolated(unsafe) var gFrozenValid = false
 /// Whether the gesture currently (or just) active ever entered a swipe. Drives the
 /// tail length at gesture end: the long tails exist to absorb the left/right clicks
 /// macOS can synthesize from a sloppy *tap-like* lift, but fingers that have
@@ -68,16 +59,13 @@ private nonisolated(unsafe) var gLastTimeoutReenable: CFTimeInterval = 0
 /// WindowServer re-enable fight that caused the original reboot-level freeze.
 private let gTimeoutRefightWindow: CFTimeInterval = 0.5
 
-/// Drop the "active suppression" triple. CALLER MUST HOLD `gSuppressLock`. Single-sources the
-/// reset the two self-heal sites (the callback below + `tick()`) and `stop()` all perform when a
-/// gesture is done or its stream died — a stale field here is exactly how suppression wedges, so
-/// keeping the set in one place stops the copies from drifting. `gFrozen` is deliberately left
-/// alone: it's meaningless while `gFrozenValid` is false (see its declaration) and is recaptured on
-/// the next swipe's first motion frame.
+/// Drop the "active suppression" pair. CALLER MUST HOLD `gSuppressLock`. Single-sources the reset the
+/// two self-heal sites (the callback below + `tick()`) and `stop()` all perform when a gesture is done
+/// or its stream died — a stale field here is exactly how suppression wedges, so keeping the set in one
+/// place stops the copies from drifting.
 private func clearActiveSuppressionLocked() {
     gClickActive = false
     gCursorFreeze = false
-    gFrozenValid = false
 }
 
 private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
@@ -97,8 +85,9 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
         // A callback overran its time budget — recoverable, and DISTINCT from a revoke (which
         // arrives as .tapDisabledByUserInput, above). Conflating the two and never re-enabling
         // meant a single mid-swipe timeout killed cursor-freeze + click-suppression for the
-        // rest of that gesture (cursor could drift onto the ⌘Tab HUD; a sloppy lift could leak
-        // a click). Re-enable so the gesture is protected again — but only while a gesture
+        // rest of that gesture (motion events stop being swallowed, so the ⌘Tab HUD gets the
+        // hover-trigger event and hijacks its selection; a sloppy lift could leak a click).
+        // Re-enable so the gesture is protected again — but only while a gesture
         // genuinely still needs it (active + fresh frames), so a timeout fired as the gesture
         // ends can't strand the tap on, and a dead stream is left for the self-heal to clear.
         //
@@ -133,66 +122,42 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
     if (gClickActive || gCursorFreeze), now - gLastFrameTime > gStaleGap {
         clearActiveSuppressionLocked()
     }
-    // The cursor-freeze state (gCursorFreeze / gFrozen / gFrozenValid) is intentionally NOT
-    // snapshotted here — the motion case re-reads it live under the lock so a freeze toggled by
-    // the framework thread between here and there can't strand a stale pin (see that case).
     let clickActive = gClickActive
+    let cursorFreeze = gCursorFreeze   // read after the self-heal above, so a stale gesture reads false
     let leftUntil = gSuppressLeftUntil
     let rightUntil = gSuppressRightUntil
     os_unfair_lock_unlock(&gSuppressLock)
 
     switch type {
     case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-        // While a swipe is live, freeze the cursor where the swipe began so its incidental
-        // nudge can't reach the ⌘Tab HUD (whose mouse-hover would otherwise hijack the
-        // selection).
+        // While a swipe drives the ⌘Tab HUD, SWALLOW the motion event (return nil). The HUD's
+        // hover-select is TRIGGERED by a mouse-motion event ARRIVING — it then reads the live
+        // (OS-moved) cursor position to pick the app — so consuming the event is what prevents the
+        // hijack: with no event delivered, the HUD never re-evaluates which app is under the cursor.
+        // Rewriting the event's `location` does NOT work (the HUD ignores it and reads the sprite,
+        // which the OS has already moved directly below this tap); 1.0.2 tried exactly that — pinned
+        // `location` and passed the event through — and the HUD still jumped to the app under the
+        // cursor. Swallowing is what the original working build did, and what holds the selection.
+        // See the trident-cmdtab-hud-cursor-hover memory.
         //
-        // RULE D — never make a synchronous CURSOR/GRAPHICS round-trip on this thread. This is an
-        // ACTIVE head-insert `.cgSessionEventTap`: the WindowServer BLOCKS on this callback for
-        // every mouse event until it returns. The old code froze the cursor with a synchronous
-        // `CGWarpMouseCursorPosition` HERE — a CGS round-trip into a WindowServer subsystem (the
-        // cursor) that is itself busy/blocked behind this very callback during a native four-finger
-        // Spaces / Mission-Control transition, so the two wedged: the WindowServer blocked waiting
-        // for this callback to return, the callback blocked in the warp the WindowServer couldn't
-        // answer — a reboot-level, system-wide input freeze. (Ordinary 3-finger swipes ran the
-        // identical warp but rarely coincide with a system transition, so it returned fast — which
-        // is why only four-finger swipes froze.) The forbidden class is the cursor/graphics calls:
-        // CGWarpMouseCursorPosition, CGAssociateMouseAndMouseCursorPosition, CGDisplay*, a
-        // cursor-reading `CGEvent(source:)`. (Re-enabling the tap PORT via `CGEvent.tapEnable` on
-        // the `.tapDisabledByTimeout` path above is a different, sanctioned thing — the documented
-        // CGEventTap recovery idiom, a trivial enable-bit toggle, not a subsystem round-trip.)
+        // The cursor SPRITE still drifts a little during the swipe (the OS moves it directly, below
+        // this tap) — that is a COSMETIC residual the user accepted, NOT a correctness issue: the
+        // swallow holds the HUD regardless of where the sprite sits.
         //
-        // So we pin WITHOUT a round-trip: rewrite the event's absolute location to the pin point
-        // and zero its deltas, then RETURN the mutated event. Setting an event's location in a
-        // head-insert session tap repositions the cursor before the WindowServer commits the
-        // move — a purely local field write, no CGS call. The HUD reads this pinned, motionless
-        // event stream, so hover-hijack is still prevented. Any residual cursor-SPRITE drift on a
-        // firm slide is cosmetic; if it ever matters, correct it with an ASYNCHRONOUS warp off
-        // this thread — never synchronously here.
-        //
-        // Decide and capture the pin under the lock using LIVE state, NOT the snapshot above. The
-        // snapshot was read-then-unlocked, so between it and here the framework thread could flip
-        // `gCursorFreeze` (a swipe ending, or the next beginning). Reading the freeze flag live and
-        // capturing/reading the pin in the SAME critical section means a lagged snapshot can never
-        // (a) inject a stale pin after the swipe ended, nor (b) leak an unpinned frame at the next
-        // swipe's start. Every frame — including the first — is pinned identically.
-        let pin: CGPoint
-        os_unfair_lock_lock(&gSuppressLock)
-        let freezeNow = gCursorFreeze
-        if freezeNow, !gFrozenValid {
-            // First motion of this swipe: this event's own location IS the pin (the cursor has
-            // moved at most one event's worth — a negligible offset — captured locally here,
-            // never via a synchronous cursor query).
-            gFrozen = event.location
-            gFrozenValid = true
-        }
-        pin = gFrozen
-        os_unfair_lock_unlock(&gSuppressLock)
-        guard freezeNow else { return Unmanaged.passUnretained(event) }
-        event.location = pin
-        event.setIntegerValueField(.mouseEventDeltaX, value: 0)
-        event.setIntegerValueField(.mouseEventDeltaY, value: 0)
-        return Unmanaged.passUnretained(event)
+        // RULE D — DO NOT pin that sprite with a synchronous cursor/graphics round-trip on THIS
+        // thread. This is an ACTIVE head-insert `.cgSessionEventTap`: the WindowServer BLOCKS on this
+        // callback for every mouse event until it returns. The original froze the cursor with a
+        // synchronous `CGWarpMouseCursorPosition` HERE — a CGS round-trip into the cursor subsystem
+        // that is itself blocked behind this very callback during a native four-finger Spaces /
+        // Mission-Control transition, so the two wedged into a reboot-level, system-wide input freeze.
+        // (Ordinary 3-finger swipes ran the identical warp but rarely coincide with a system
+        // transition, so it returned fast — which is why only four-finger swipes froze.) Forbidden
+        // class: CGWarp*, CGAssociate*, CGDisplay*, a cursor-reading `CGEvent(source:)`. (An async
+        // off-thread warp is RULE-D-safe but was removed — it was defeated through the very Spaces
+        // transition it targeted and bought too little cosmetic value for its race surface.)
+        // (Re-enabling the tap PORT via `CGEvent.tapEnable` on the `.tapDisabledByTimeout` path above
+        // is a different, sanctioned thing — a trivial enable-bit toggle, not a subsystem round-trip.)
+        return cursorFreeze ? nil : Unmanaged.passUnretained(event)
     case .rightMouseDown, .rightMouseUp:
         // Secondary clicks get a longer tail: a stray two-finger secondary click from an
         // uneven three-finger lift is recognized by the system well *after* the fingers
@@ -213,8 +178,10 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
 
 /// A system event tap that — **only while a three-finger gesture needs it** — (1) swallows
 /// the native left/right mouse clicks macOS can synthesize from a sloppy tap, and (2) during
-/// a *swipe* freezes the cursor (pinning it where the swipe began) so it can't nudge onto the
-/// ⌘Tab HUD and hijack the selection.
+/// a *swipe* swallows the cursor-motion events (returns nil) so the ⌘Tab HUD never gets the
+/// mouse-hover trigger that would hijack its selection to the app under the cursor. (The cursor
+/// sprite still drifts a little — the OS moves it directly, below this tap — but that is
+/// cosmetic; denying the HUD the motion event is what holds the selection.)
 ///
 /// **The tap is enabled on demand and disabled when idle.** An always-on session tap is a
 /// synchronous, system-wide dependency: if this process can't service it — which is what
@@ -268,13 +235,12 @@ final class GestureEventSuppressor: @unchecked Sendable {
         let mask = bit(.leftMouseDown) | bit(.leftMouseUp) | bit(.rightMouseDown) | bit(.rightMouseUp)
             | bit(.mouseMoved) | bit(.leftMouseDragged) | bit(.rightMouseDragged) | bit(.otherMouseDragged)
 
-        // Session-level tap (Accessibility only — no Input Monitoring needed). A HID-level
-        // tap was tried to *swallow* motion (return nil) before the cursor moves, but the system
-        // moved the cursor directly regardless, so it bought nothing and cost an extra permission.
-        // NB: that finding is about HID-level *swallowing* — it does NOT mean a session tap can't
-        // reposition the cursor. The cursor freeze pins the pointer by rewriting `event.location`
-        // on this session tap (see the .mouseMoved case); do not "fix" that back into a synchronous
-        // CGWarp — that is exactly the four-finger Spaces deadlock RULE D forbids.
+        // Session-level tap (Accessibility only — no Input Monitoring needed). A HID-level tap was
+        // tried to swallow motion before the cursor moves, but the system moved the cursor directly
+        // regardless, so it bought nothing and cost an extra permission. The cursor freeze instead
+        // SWALLOWS the motion events on this session tap (return nil; see the .mouseMoved case), which
+        // denies the ⌘Tab HUD its hover trigger. Do NOT "fix" that into a synchronous CGWarp to pin
+        // the sprite — that is exactly the four-finger Spaces deadlock RULE D forbids (see that case).
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
@@ -384,17 +350,11 @@ final class GestureEventSuppressor: @unchecked Sendable {
         if active { enableTap() }   // ensure the tap is live for the duration of the gesture
     }
 
-    /// Called when a swipe begins/ends. Drives the cursor freeze; the pin point is
-    /// captured lazily from the first cursor-motion event (see the callback), so this
-    /// never touches CoreGraphics on the hot path. Thread-safe.
+    /// Called when a swipe begins/ends. Drives the cursor freeze, which swallows cursor-motion events
+    /// while the swipe holds the ⌘Tab HUD (see the callback). Touches no CoreGraphics. Thread-safe.
     func setCursorFreeze(_ active: Bool) {
         os_unfair_lock_lock(&gSuppressLock)
         gCursorFreeze = active
-        // Drop any captured pin on EITHER transition: on activate the next swipe must re-capture,
-        // and on deactivate a stale pin must never survive to be reused by a later frame that
-        // races a re-activation. The motion case also reads freeze state live, but clearing here
-        // is the cheap belt-and-suspenders.
-        gFrozenValid = false
         if active {
             gWasSwipe = true      // this gesture swiped → short tail at gesture end
         }
