@@ -3,6 +3,15 @@
     <channel>
         <title>Trident</title>
         <item>
+            <title>1.0.3</title>
+            <pubDate>Sat, 27 Jun 2026 00:39:26 +0800</pubDate>
+            <link>https://github.com/cyanyux/trident</link>
+            <sparkle:version>5</sparkle:version>
+            <sparkle:shortVersionString>1.0.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/cyanyux/trident/releases/download/v1.0.3/Trident-1.0.3.zip" length="1560230" type="application/octet-stream" sparkle:edSignature="XOYNF5t7ZotIT6xHvv3HEBJaCqJmouj1HFTI5OIKgiVoKpFXQcfvFOO53dcK02a+3VMAc2CNeUtnd2lxasCWAw=="/>
+        </item>
+        <item>
             <title>1.0.2</title>
             <pubDate>Fri, 26 Jun 2026 16:38:43 +0800</pubDate>
             <link>https://github.com/cyanyux/trident</link>
@@ -19,15 +28,6 @@
             <sparkle:shortVersionString>1.0.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/cyanyux/trident/releases/download/v1.0.1/Trident-1.0.1.zip" length="1557851" type="application/octet-stream" sparkle:edSignature="CkrvJbVPWwW0YtPx9lQw0TSH0+4woZxfR7BmLxW/SoKibZgRytE6G8f+XyAmhAEziYbEaNnoR0GiroiHW2QUAA=="/>
-        </item>
-        <item>
-            <title>1.0</title>
-            <pubDate>Sat, 13 Jun 2026 02:33:08 +0800</pubDate>
-            <link>https://github.com/cyanyux/trident</link>
-            <sparkle:version>2</sparkle:version>
-            <sparkle:shortVersionString>1.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/cyanyux/trident/releases/download/v1.0/Trident-1.0.zip" length="1550510" type="application/octet-stream" sparkle:edSignature="YfjSO8eRZeTviA2vhBVf7fDlWd0bTgbi5Oz83npek3J9Jhx6/NjWRNttzK0MeiTeqd1QLuLjZB6WOWVZ5B0IDw=="/>
         </item>
     </channel>
 </rss>
