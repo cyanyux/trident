@@ -88,20 +88,52 @@ final class GestureRecognizer: @unchecked Sendable {
     /// bridge a one-or-two-frame sensor dropout mid-pinch without re-anchoring.
     private let pathGapFrames = 8
 
-    /// After a gesture ends abnormally — 4+ fingers seen (a system gesture like
-    /// Launchpad / show desktop / Mission Control), the sub-3 dwell bound, or a stalled
-    /// stream — a re-armed gesture starting within this window is tap-disqualified from
-    /// birth (swipes are unaffected). The tail of a system gesture flickers through
-    /// exactly three contacts as fingers merge and lift; without the quarantine each
-    /// flicker re-armed tracking with a fresh, pristine tap window, so the *end* of a
-    /// Launchpad pinch could still fire a middle click no matter what the earlier
-    /// frames showed. A clean lift to zero never quarantines, so deliberate rapid
-    /// re-taps stay instant.
-    private let tapQuarantine: Double = 0.3
+    /// After 4+ fingers are seen (a system gesture: Launchpad, show desktop, Mission
+    /// Control, a Spaces swipe) or a gesture ends abnormally (the sub-3 dwell bound, a
+    /// stalled stream), a gesture born within this window is quarantined for its whole
+    /// life. The tail of a system gesture flickers through exactly three contacts as
+    /// fingers merge and lift; without the quarantine each flicker re-armed tracking
+    /// pristine, so the *end* of a Launchpad pinch could fire a middle click — and,
+    /// worse, the fast-moving three-contact tail of a four-finger Spaces swipe crossed
+    /// the swipe threshold and posted a phantom ⌘Tab into the middle of the system's
+    /// own space transition. On-device that collision wedged the Dock's Spaces state
+    /// machine ("Not finished animating space changes"), leaving four-finger gestures
+    /// dead until the Dock was restarted.
+    ///
+    /// What the quarantine bars depends on what armed it: every abnormal end bars the
+    /// tap, but only an actual 4+-finger sighting bars the swipe — a dwell or stall is
+    /// no evidence of a four-finger transition, and a third finger returning to two
+    /// dwelling ones should swipe freely. A clean lift to zero from a *three*-finger
+    /// gesture never quarantines, so deliberate rapid re-taps and re-swipes stay
+    /// instant.
+    ///
+    /// The swipe bar is fixed at the gesture's BIRTH and lasts its whole life, not
+    /// just this window — so after a 4th-finger graze cancels a live switch, keeping
+    /// three fingers down bars swiping until they all lift and re-plant. Deliberate: a
+    /// 4-contact frame is indistinguishable from the user starting a real system
+    /// gesture, an entry-time check would let a four-finger swipe that sheds a finger
+    /// simply outlive the window and fire the phantom ⌘Tab late, and the re-plant is
+    /// instant. Safety wins the tie.
+    private let reArmQuarantine: Double = 0.3
 
     // Swipe geometry.
     private let entryDominance: Float = 1.5   // |Δx| must beat |Δy| by this to start a swipe
     private let stepDominance: Float = 1.0    // looser once a swipe is underway
+
+    /// A swipe entry is HELD this long before anything is posted, to confirm no 4th
+    /// finger is still landing. The quarantine (`reArmQuarantine`) covers 4+ fingers
+    /// seen BEFORE a gesture arms, but it cannot see a finger that hasn't landed: a
+    /// four-finger Spaces swipe's fingers can land a frame or two apart, so the first
+    /// three arm tracking as a clean gesture — and a fast hand crosses the step
+    /// threshold before the 4th contact registers, posting the phantom ⌘Tab
+    /// mid-space-transition all over again. Holding the entry lets the straggler show
+    /// up and kill the gesture silently: nothing has been posted, so there is nothing
+    /// to cancel. The feel cost is nil where it matters — fingers lifting during the
+    /// hold confirm immediately (a landing count doesn't fall), so a quick
+    /// flick-and-lift still switches the instant it always did; only a held scrub's
+    /// first step lands these few ms later, invisible against the HUD's own 250 ms
+    /// reveal. 40 ms ≈ 5 frames at the built-in trackpad's ~125 Hz.
+    private let entryConfirmDelay: Double = 0.04
 
     /// While swiping, only three fingers drive the switch. A contact count below three
     /// must persist this many frames before the swipe commits — absorbing a one- or
@@ -201,12 +233,28 @@ final class GestureRecognizer: @unchecked Sendable {
     private var frameCount: Int = 0
     private var lastValidCount: Int = 0
     private var movedTooFar = false
+    /// Whether this gesture was born inside the four-finger quarantine window — the
+    /// tail of a system gesture. Fixed at birth; bars the swipe (the tap is barred
+    /// through `movedTooFar`). See `reArmQuarantine`.
+    private var bornInSystemGestureTail = false
+    /// Whether this gesture was born inside the tap quarantine window. Feeds
+    /// `movedTooFar`; kept separately only so the gesture-end forensic line can tell
+    /// a quarantine-barred tap from a travel-cancelled one.
+    private var bornTapQuarantined = false
+    /// When the swipe's entry conditions were first met, while the entry is held to
+    /// confirm no 4th finger is still landing (see `entryConfirmDelay`). `nil` when no
+    /// entry is pending.
+    private var swipePendingSince: Double?
     private var swipeStartTime: Double = 0
     /// Timestamp of the previous frame, used to detect a stalled-then-resumed stream.
     private var lastTimestamp: Double = 0
     /// Gestures re-armed before this (device-stream) timestamp start tap-disqualified
-    /// (see `tapQuarantine`).
+    /// (see `reArmQuarantine`).
     private var quarantineUntil: Double = 0
+    /// Gestures re-armed before this timestamp are the tail of a four-finger system
+    /// gesture and start swipe-disqualified too (see `reArmQuarantine`). Advanced only
+    /// by actual 4+-finger sightings, never by the dwell/stall re-arms.
+    private var swipeQuarantineUntil: Double = 0
     /// Consecutive frames seen with fewer than three contacts while swiping (debounce).
     private var lowFrameCount: Int = 0
 
@@ -224,7 +272,12 @@ final class GestureRecognizer: @unchecked Sendable {
         // a fresh gesture via the .idle case below.
         if phase != .idle, timestamp - lastTimestamp > staleFrameGap {
             if phase == .swiping { onAction?(.cancel) }
-            quarantineUntil = timestamp + tapQuarantine
+            quarantineUntil = timestamp + reArmQuarantine
+            // The swipe quarantine is CLEARED, not rebased: a stall is no evidence of a
+            // four-finger transition, and a resumed stream's timestamp domain may
+            // differ — comparing a stale deadline against it is meaningless in either
+            // direction (resetState() clears both for the same reason).
+            swipeQuarantineUntil = 0
             reset()
         }
         lastTimestamp = timestamp
@@ -267,9 +320,19 @@ final class GestureRecognizer: @unchecked Sendable {
 
         switch phase {
         case .idle:
-            // Only arm a gesture when at least one mapping can actually fire; otherwise
-            // three fingers would needlessly drive the click suppressor for no benefit.
-            if valid == 3, cfg.middleClickEnabled || cfg.appSwitchEnabled {
+            if valid >= 4 {
+                // A system gesture is in flight. Refreshing the quarantine every frame
+                // extends it to 0.3 s past the LAST 4-finger sighting, so the gesture's
+                // three-contact tail is quarantined however it lands. Without this, a
+                // four-finger Spaces swipe whose fingers all land in the same frame never
+                // passes through .tracking — the only place the quarantine was armed —
+                // and its tail could tap or (worse) fire a phantom ⌘Tab app-switch.
+                // (The reverse direction — a 4th finger landing AFTER three armed a
+                // clean gesture — is covered by the `entryConfirmDelay` hold.)
+                quarantineFourFingerSighting(at: timestamp)
+            } else if valid == 3, cfg.middleClickEnabled || cfg.appSwitchEnabled {
+                // Only arm a gesture when at least one mapping can actually fire; otherwise
+                // three fingers would needlessly drive the click suppressor for no benefit.
                 beginTracking(cx: cx, cy: cy, maxPathTravelMM: maxPathTravelMM, timestamp: timestamp)
             }
         case .tracking:
@@ -302,6 +365,13 @@ final class GestureRecognizer: @unchecked Sendable {
         return 0
     }
 
+    /// A 4+-finger sighting quarantines re-arms from BOTH the tap and the swipe (the
+    /// dwell/stall sites advance only `quarantineUntil` — see `reArmQuarantine`).
+    private func quarantineFourFingerSighting(at timestamp: Double) {
+        quarantineUntil = timestamp + reArmQuarantine
+        swipeQuarantineUntil = timestamp + reArmQuarantine
+    }
+
     private func beginTracking(cx: Float, cy: Float, maxPathTravelMM: Float, timestamp: Double) {
         phase = .tracking
         anchorX = cx
@@ -309,11 +379,19 @@ final class GestureRecognizer: @unchecked Sendable {
         startTime = timestamp
         frameCount = 1
         gestureMaxTravel = maxPathTravelMM
-        // Born inside the quarantine window (the flickering tail of a system gesture),
-        // or from touches that have already travelled (a pinch mid-flight whose thumb
-        // just slid into the palm filter's edge band) → tap-disqualified from the
-        // start. Swipes don't consult this flag.
-        movedTooFar = timestamp < quarantineUntil || maxPathTravelMM > tapPathTravelCancelMM
+        // Born inside the four-finger quarantine window: this "gesture" is the
+        // flickering tail of a system gesture — barred from swiping for its whole life
+        // (see `reArmQuarantine`). Birth-time, not entry-time: a four-finger swipe that
+        // sheds a finger and continues on three would otherwise just outlive the window
+        // and fire the phantom ⌘Tab 0.3 s late.
+        bornInSystemGestureTail = timestamp < swipeQuarantineUntil
+        // The tap is additionally barred by every abnormal-end quarantine, and by
+        // touches that have already travelled (a pinch mid-flight whose thumb just slid
+        // into the palm filter's edge band). Travel does NOT bar the swipe: a
+        // legitimate swipe can arm late with accumulated travel when a finger starts
+        // inside the edge band and sweeps out of it.
+        bornTapQuarantined = timestamp < quarantineUntil
+        movedTooFar = bornTapQuarantined || maxPathTravelMM > tapPathTravelCancelMM
         onGestureActiveChanged?(true)
     }
 
@@ -321,10 +399,44 @@ final class GestureRecognizer: @unchecked Sendable {
                                 timestamp: Double, config: Config, widthMM: Float, heightMM: Float) {
         if valid >= 4 {
             // 4+ fingers belong to the system (Mission Control, Launchpad, show
-            // desktop). Quarantine the re-arm: those gestures' tails flicker through
-            // exactly three contacts, which must not open a fresh tap window.
-            quarantineUntil = timestamp + tapQuarantine
+            // desktop, Spaces). Quarantine the re-arm: those gestures' tails flicker
+            // through exactly three contacts, which must not open a fresh tap OR
+            // swipe window.
+            quarantineFourFingerSighting(at: timestamp)
             reset()
+            return
+        }
+        if let pending = swipePendingSince {
+            // A swipe entry is held awaiting confirmation that no 4th finger is still
+            // landing (see `entryConfirmDelay`). Nothing has been posted yet, so the
+            // 4+ branch above disposes of a straggler-revealed system gesture silently.
+            if valid == 0 {
+                // Clean lift during the hold: a quick flick. No 4th finger can be
+                // arriving through a falling count — confirm and commit right now, so
+                // the hold adds zero latency to the flick-and-lift switch.
+                onAction?(.swipeBegin)
+                onAction?(.swipeStep(.forward))
+                onAction?(.swipeCommit)
+                reset()
+                return
+            }
+            if valid < 3 {
+                // Sub-3 during the hold: a staggered lift, or a one-frame dropout.
+                // Debounce exactly like handleSwiping's commit path — don't emit while
+                // a dropout could still be a landing straggler mid-flicker.
+                lowFrameCount += 1
+                if lowFrameCount >= endDebounceFrames {
+                    onAction?(.swipeBegin)
+                    onAction?(.swipeStep(.forward))
+                    onAction?(.swipeCommit)
+                    reset()
+                }
+                return
+            }
+            lowFrameCount = 0
+            if timestamp - pending >= entryConfirmDelay {
+                enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
+            }
             return
         }
         if valid == 0 {
@@ -336,6 +448,7 @@ final class GestureRecognizer: @unchecked Sendable {
             log.notice("""
                 gesture end: tap=\(tap) elapsed=\(elapsed, format: .fixed(precision: 3))s \
                 frames=\(self.frameCount) moved=\(self.movedTooFar) \
+                tapQuar=\(self.bornTapQuarantined) swipeQuar=\(self.bornInSystemGestureTail) \
                 maxPathTravel=\(self.gestureMaxTravel, format: .fixed(precision: 1))mm
                 """)
             reset()
@@ -358,9 +471,12 @@ final class GestureRecognizer: @unchecked Sendable {
             let dxMM = (cx - anchorX) * widthMM
             let dyMM = (cy - anchorY) * heightMM
             let adx = abs(dxMM), ady = abs(dyMM)
-            if valid == 3, config.appSwitchEnabled,
+            if valid == 3, config.appSwitchEnabled, !bornInSystemGestureTail,
                adx >= config.swipeDistanceMM, adx > entryDominance * ady {
-                enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
+                // Entry conditions met — HOLD rather than emit (see `entryConfirmDelay`
+                // and the pending block above). The anchor stays put: travel keeps
+                // accumulating, and enterSwiping re-anchors at confirmation anyway.
+                swipePendingSince = timestamp
                 return
             }
             if hypotf(dxMM, dyMM) > tapMoveCancelMM {
@@ -374,13 +490,14 @@ final class GestureRecognizer: @unchecked Sendable {
         // fingers left resting after a three-finger touch suppressed clicks forever.
         // Quarantined: the dwell often *is* a system gesture's tail mid-merge.
         if valid < 3, timestamp - startTime > tapMaxDuration {
-            quarantineUntil = timestamp + tapQuarantine
+            quarantineUntil = timestamp + reArmQuarantine
             reset()
         }
     }
 
     private func enterSwiping(cx: Float, cy: Float, timestamp: Double) {
         phase = .swiping
+        swipePendingSince = nil
         swipeStartTime = timestamp
         onAction?(.swipeBegin)
         // The first step always opens forward (⌘Tab), regardless of swipe direction.
@@ -397,7 +514,7 @@ final class GestureRecognizer: @unchecked Sendable {
                                distanceMM: Float, widthMM: Float, heightMM: Float) {
         if valid >= 4 {
             onAction?(.cancel)
-            quarantineUntil = timestamp + tapQuarantine
+            quarantineFourFingerSighting(at: timestamp)
             reset()
             return
         }
@@ -450,11 +567,12 @@ final class GestureRecognizer: @unchecked Sendable {
     /// Clear all state back to idle without emitting any action. The engine calls this
     /// before `start()` so a restart never resumes a stale phase left by a run that
     /// stopped mid-gesture; it is safe because frame delivery is not yet enabled when
-    /// the engine calls it. Also drops the tap quarantine: a fresh stream's timestamp
+    /// the engine calls it. Also drops both quarantines: a fresh stream's timestamp
     /// domain may differ, so a stale deadline could quarantine forever (or not at all).
     func resetState() {
         clearGesture()
         quarantineUntil = 0
+        swipeQuarantineUntil = 0
         pathAnchors.removeAll(keepingCapacity: true)
         frameIndex = 0
     }
@@ -479,6 +597,9 @@ final class GestureRecognizer: @unchecked Sendable {
         frameCount = 0
         lastValidCount = 0
         movedTooFar = false
+        bornInSystemGestureTail = false
+        bornTapQuarantined = false
+        swipePendingSince = nil
         swipeStartTime = 0
         lastTimestamp = 0
         lowFrameCount = 0

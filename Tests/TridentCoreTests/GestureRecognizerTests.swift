@@ -47,6 +47,15 @@ final class GestureRecognizerTests: XCTestCase {
          contact(centerX + 0.03, centerY, path: 2)]
     }
 
+    /// Four contacts whose centroid is (`centerX`, `centerY`) — a system gesture
+    /// (Spaces swipe, Mission Control) as the sensor sees it. Paths 0/1/2/3.
+    private func fourFingers(centerX: Float, centerY: Float = 0.5) -> [MTTouch] {
+        [contact(centerX - 0.045, centerY, path: 0),
+         contact(centerX - 0.015, centerY, path: 1),
+         contact(centerX + 0.015, centerY, path: 2),
+         contact(centerX + 0.045, centerY, path: 3)]
+    }
+
     /// Feed one frame. An empty frame still passes a valid pointer with count 0.
     private func feed(_ touches: [MTTouch], at timestamp: Double) {
         if touches.isEmpty {
@@ -190,8 +199,8 @@ final class GestureRecognizerTests: XCTestCase {
     func testSwipeRightEmitsForwardThenCommit() {
         feed(threeFingers(centerX: 0.40), at: 0.00)
         feed(threeFingers(centerX: 0.46), at: 0.02)  // small move, not yet a swipe
-        feed(threeFingers(centerX: 0.56), at: 0.04)  // crosses threshold → forward
-        feed([], at: 0.08)
+        feed(threeFingers(centerX: 0.56), at: 0.04)  // crosses threshold → entry held
+        feed([], at: 0.08)                            // lift confirms → begin + forward + commit
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
 
@@ -200,8 +209,8 @@ final class GestureRecognizerTests: XCTestCase {
     /// Direction only governs scrubbing once the HUD is up (next test).
     func testQuickLeftFlickSwitchesToPreviousApp() {
         feed(threeFingers(centerX: 0.60), at: 0.00)
-        feed(threeFingers(centerX: 0.44), at: 0.02)  // crosses threshold leftward
-        feed([], at: 0.06)
+        feed(threeFingers(centerX: 0.44), at: 0.02)  // crosses threshold leftward → held
+        feed([], at: 0.06)                            // lift confirms instantly — no added latency
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
 
@@ -209,7 +218,8 @@ final class GestureRecognizerTests: XCTestCase {
     /// step opens forward, then each further leftward threshold steps back.
     func testLeftScrubWithHUDStepsBackward() {
         feed(threeFingers(centerX: 0.70), at: 0.00)
-        feed(threeFingers(centerX: 0.54), at: 0.02)  // begin + first step (opens forward)
+        feed(threeFingers(centerX: 0.54), at: 0.02)  // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.54), at: 0.07)  // hold confirmed → begin + first step (opens forward)
         feed(threeFingers(centerX: 0.38), at: 0.35)  // HUD up → backward
         feed(threeFingers(centerX: 0.22), at: 0.70)  // backward
         feed([], at: 0.75)
@@ -223,9 +233,9 @@ final class GestureRecognizerTests: XCTestCase {
     /// initial switch fires — the extra pre-HUD crossings are swallowed.
     func testFastSweepSwitchesOnce() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.44), at: 0.02)  // begin + step
-        feed(threeFingers(centerX: 0.58), at: 0.04)  // crossing, but pre-HUD → swallowed
-        feed(threeFingers(centerX: 0.72), at: 0.06)  // crossing, but pre-HUD → swallowed
+        feed(threeFingers(centerX: 0.44), at: 0.02)  // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.58), at: 0.04)  // still inside the hold
+        feed(threeFingers(centerX: 0.72), at: 0.06)  // hold confirmed → begin + step
         feed([], at: 0.08)
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
@@ -235,7 +245,8 @@ final class GestureRecognizerTests: XCTestCase {
     /// steps again.
     func testSlowSweepStepsOncePerThresholdWithHUD() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.44), at: 0.02)  // begin + first step
+        feed(threeFingers(centerX: 0.44), at: 0.02)  // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.44), at: 0.07)  // hold confirmed → begin + first step
         feed(threeFingers(centerX: 0.58), at: 0.35)  // HUD up → step
         feed(threeFingers(centerX: 0.72), at: 0.70)  // step
         feed([], at: 0.75)
@@ -256,8 +267,9 @@ final class GestureRecognizerTests: XCTestCase {
 
     func testFourFingersCancelActiveSwipe() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.46), at: 0.02)  // begin + step
-        feed([contact(0.2, 0.5, path: 0), contact(0.4, 0.5, path: 1), contact(0.6, 0.5, path: 2), contact(0.8, 0.5, path: 3)], at: 0.04)
+        feed(threeFingers(centerX: 0.46), at: 0.02)  // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.46), at: 0.07)  // hold confirmed → begin + step
+        feed([contact(0.2, 0.5, path: 0), contact(0.4, 0.5, path: 1), contact(0.6, 0.5, path: 2), contact(0.8, 0.5, path: 3)], at: 0.09)
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .cancel])
     }
 
@@ -274,7 +286,8 @@ final class GestureRecognizerTests: XCTestCase {
     /// fingers start a fresh gesture instead of stepping a switcher that's already gone.
     func testStalledStreamAbandonsInFlightSwipe() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.46), at: 0.02)  // swipeBegin + forward step
+        feed(threeFingers(centerX: 0.46), at: 0.02)  // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.46), at: 0.07)  // hold confirmed → swipeBegin + forward step
         feed(threeFingers(centerX: 0.62), at: 2.50)  // >2 s gap → abandon (.cancel), re-arm fresh
         feed([], at: 2.54)                            // fresh tracking, single frame → no tap
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .cancel])
@@ -284,9 +297,10 @@ final class GestureRecognizerTests: XCTestCase {
     /// `>`), so the gesture continues rather than being abandoned — guards the boundary.
     func testFrameGapAtStaleThresholdDoesNotAbandon() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + forward; lastTimestamp = 0.02
-        feed(threeFingers(centerX: 0.62), at: 2.02)   // gap == 2.0 (not > 2.0) → continues; HUD up → step
-        feed([], at: 2.05)
+        feed(threeFingers(centerX: 0.46), at: 0.02)   // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.46), at: 0.07)   // hold confirmed → begin + forward; lastTimestamp = 0.07
+        feed(threeFingers(centerX: 0.62), at: 2.07)   // gap == 2.0 (not > 2.0) → continues; HUD up → step
+        feed([], at: 2.10)
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
     }
 
@@ -295,9 +309,10 @@ final class GestureRecognizerTests: XCTestCase {
     /// post-HUD scrubbing.
     func testStepAtHUDRevealBoundaryEmits() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + forward; swipeStartTime = 0.02
-        feed(threeFingers(centerX: 0.62), at: 0.27)   // 0.27 - 0.02 == 0.25 == hudRevealDelay → steps
-        feed([], at: 0.30)
+        feed(threeFingers(centerX: 0.46), at: 0.02)   // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.46), at: 0.07)   // hold confirmed → begin + forward; swipeStartTime = 0.07
+        feed(threeFingers(centerX: 0.62), at: 0.32)   // 0.32 - 0.07 == 0.25 == hudRevealDelay → steps
+        feed([], at: 0.35)
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
     }
 
@@ -317,12 +332,94 @@ final class GestureRecognizerTests: XCTestCase {
     /// commits early nor steps on the dip, and resumes stepping once three fingers return.
     func testTransientFingerDipDoesNotCommit() {
         feed(threeFingers(centerX: 0.30), at: 0.00)
-        feed(threeFingers(centerX: 0.46), at: 0.02)   // begin + first step
-        feed([contact(0.50, 0.5, path: 1)], at: 0.04)  // 1-frame dropout to one contact — absorbed
+        feed(threeFingers(centerX: 0.46), at: 0.02)   // crosses threshold → entry held
+        feed(threeFingers(centerX: 0.46), at: 0.07)   // hold confirmed → begin + first step
+        feed([contact(0.50, 0.5, path: 1)], at: 0.09)  // 1-frame dropout to one contact — absorbed
         feed(threeFingers(centerX: 0.62), at: 0.40)   // three back, HUD up → re-anchor, no phantom step
         feed(threeFingers(centerX: 0.80), at: 0.42)   // real travel → one more step
         feed([], at: 0.45)                            // lift → commit
         XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    // MARK: - System-gesture tail quarantine
+    //
+    // The tail of a four-finger system gesture (a Spaces swipe, Mission Control)
+    // passes through exactly three fast-moving contacts as fingers lift. That tail
+    // must never fire an app-switch: a phantom ⌘Tab posted mid-space-transition
+    // wedged the Dock's Spaces state machine on-device ("Not finished animating
+    // space changes"), killing four-finger gestures until the Dock was restarted.
+
+    /// Four fingers landing in the same frame never pass through `.tracking`, so the
+    /// quarantine must be armed from `.idle` — the swipe's three-contact tail, still
+    /// moving fast enough to cross the step threshold, must not switch apps.
+    func testFourFingerSwipeTailDoesNotAppSwitch() {
+        feed(fourFingers(centerX: 0.70), at: 0.00)   // system Spaces swipe — recognizer idle
+        feed(fourFingers(centerX: 0.60), at: 0.02)
+        feed(threeFingers(centerX: 0.50), at: 0.04)  // one finger lifts first — tail arms quarantined
+        feed(threeFingers(centerX: 0.34), at: 0.06)  // 16 mm left, over threshold — must not swipe
+        feed([], at: 0.10)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A four-finger swipe that sheds one finger and *continues* on three is still the
+    /// system gesture's tail. The bar is fixed at the gesture's birth — it must not
+    /// simply outlive the quarantine window and fire the phantom switch late.
+    func testThreeFingerContinuationOfFourFingerSwipeDoesNotAppSwitch() {
+        feed(fourFingers(centerX: 0.80), at: 0.00)
+        feed(fourFingers(centerX: 0.70), at: 0.02)
+        feed(threeFingers(centerX: 0.60), at: 0.04)  // pinky lifts, swipe carries on
+        feed(threeFingers(centerX: 0.44), at: 0.06)  // over threshold — must not swipe
+        feed(threeFingers(centerX: 0.28), at: 0.35)  // even beyond the quarantine window
+        feed([], at: 0.40)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Same for the staggered landing (3 land, 4th joins, back to 3): the flicker used
+    /// to be tap-quarantined only, so the tail could still fire a phantom app-switch.
+    func testThreeContactFlickerAfterFourFingersDoesNotSwipe() {
+        feed(threeFingers(centerX: 0.50), at: 0.00)
+        feed(fourFingers(centerX: 0.50), at: 0.03)   // 4th finger joins → quarantine + reset
+        feed(threeFingers(centerX: 0.50), at: 0.05)  // tail flicker — re-arms quarantined
+        feed(threeFingers(centerX: 0.34), at: 0.07)  // over threshold — must not swipe
+        feed([], at: 0.10)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The quarantine can't see a finger that hasn't landed: a four-finger swipe whose
+    /// fingers land a frame or two apart arms tracking as a clean THREE-finger gesture,
+    /// and a fast hand crosses the step threshold before the 4th contact registers.
+    /// The entry hold must let the straggler show up and kill the gesture silently —
+    /// nothing posted, nothing to cancel.
+    func testStaggeredFourFingerLandingDoesNotAppSwitch() {
+        feed(threeFingers(centerX: 0.70), at: 0.000)  // first three land, pinky not yet down
+        feed(threeFingers(centerX: 0.66), at: 0.008)  // moving, under threshold
+        feed(threeFingers(centerX: 0.55), at: 0.016)  // 15 mm — crosses threshold → entry held
+        feed(fourFingers(centerX: 0.50), at: 0.024)   // pinky finally registers → silent reset
+        feed([], at: 0.05)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A contact dropout during the entry hold must not rush the emission: the count
+    /// dipping is exactly what a mid-landing flicker looks like, so the hold debounces
+    /// it — and the late 4th finger is still caught.
+    func testFingerDipDuringEntryHoldStillCatchesLateFourth() {
+        feed(threeFingers(centerX: 0.70), at: 0.000)
+        feed(threeFingers(centerX: 0.55), at: 0.008)  // crosses threshold → entry held
+        feed([contact(0.53, 0.5, path: 0), contact(0.57, 0.5, path: 2)], at: 0.016)  // 1-frame dip
+        feed(fourFingers(centerX: 0.50), at: 0.024)   // 4th lands → silent reset
+        feed([], at: 0.05)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The quarantine is a window, not a latch: a deliberate three-finger swipe
+    /// starting after it expires switches normally.
+    func testSwipeAfterQuarantineExpiresSwitchesNormally() {
+        feed(fourFingers(centerX: 0.50), at: 0.00)   // quarantine until 0.30
+        feed([], at: 0.02)
+        feed(threeFingers(centerX: 0.40), at: 0.40)  // born clean
+        feed(threeFingers(centerX: 0.56), at: 0.42)
+        feed([], at: 0.46)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
     }
 
     // MARK: - Suppression lifecycle
