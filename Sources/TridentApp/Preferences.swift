@@ -61,9 +61,16 @@ final class Preferences: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.enabled) }
     }
 
-    /// Millimetres of horizontal travel required per app-switch step.
+    /// Millimetres of horizontal travel required per app-switch step. Clamped to the
+    /// slider range on read: `defaults write` can store any value, and a 0 (or NaN)
+    /// would fire a switch every frame while a huge value disables the gesture
+    /// entirely — with the UI still showing the slider's own sane limits.
     var swipeDistanceMM: Float {
-        get { defaults.float(forKey: Keys.swipeDistanceMM) }
+        get {
+            let v = defaults.float(forKey: Keys.swipeDistanceMM)
+            guard v.isFinite else { return SwipeTuning.defaultMM }
+            return min(max(v, SwipeTuning.minMM), SwipeTuning.maxMM)
+        }
         set { defaults.set(newValue, forKey: Keys.swipeDistanceMM) }
     }
 
@@ -85,9 +92,15 @@ final class Preferences: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.hapticAppSwitch) }
     }
 
-    /// Millimetres in from each trackpad edge ignored at gesture start.
+    /// Millimetres in from each trackpad edge ignored at gesture start. Clamped on
+    /// read for the same `defaults write` reason — an out-of-range band would
+    /// silently disable (or over-fire) palm rejection while the UI disagreed.
     var palmEdgeBandMM: Float {
-        get { defaults.float(forKey: Keys.palmEdgeBandMM) }
+        get {
+            let v = defaults.float(forKey: Keys.palmEdgeBandMM)
+            guard v.isFinite else { return PalmTuning.defaultMM }
+            return min(max(v, PalmTuning.minMM), PalmTuning.maxMM)
+        }
         set { defaults.set(newValue, forKey: Keys.palmEdgeBandMM) }
     }
 

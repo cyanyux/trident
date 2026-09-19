@@ -82,9 +82,13 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     private func startPolling() {
         guard pollTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+        // 3 s, not 1 Hz: each tick pays a WindowServer probe plus two synchronous
+        // cfprefsd round-trips (`CFPreferencesAppSynchronize`), which is gratuitous
+        // for a wizard where a ~3 s lag on the detection badge still feels live.
+        let timer = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshDetections() }
         }
+        timer.tolerance = 0.5
         // .common so live detection keeps updating while a menu is open or the window
         // is being dragged (default-mode timers pause during those tracking loops).
         RunLoop.main.add(timer, forMode: .common)
@@ -150,7 +154,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     private func bringToFront(_ win: NSWindow?) {
         guard let win else { return }
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         win.makeKeyAndOrderFront(nil)
     }
 

@@ -10,7 +10,7 @@
 # or a signature format that the older embedded framework on already-installed
 # clients mis-parses — silently stopping updates — and "always latest" makes builds
 # non-reproducible across machines and time. Bump this in lockstep with project.yml.
-SPARKLE_VERSION="2.6.0"
+SPARKLE_VERSION="2.9.6"
 
 ensure_sparkle_tools() {
   local root="$1"

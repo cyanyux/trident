@@ -20,7 +20,7 @@ private let contactCallback: MTContactCallbackFunction = { device, touches, numT
     // so a callback that arrives mid-stop bails out before touching any state.
     guard gEnabled, let monitor = gMonitor, let touches else {
         os_unfair_lock_unlock(&gLock)
-        return 0
+        return
     }
     let handler = monitor.onTouches
     // Read the producing trackpad's physical size while still holding the lock. This is
@@ -31,13 +31,11 @@ private let contactCallback: MTContactCallbackFunction = { device, touches, numT
 
     if let handler {
         let ptr = touches.assumingMemoryBound(to: MTTouch.self)
-        handler(ptr, Int(numTouches), timestamp, size.widthMM, size.heightMM)
+        handler(ptr, numTouches, timestamp, size.widthMM, size.heightMM)
     }
-    // Never consume — the framework ignores this return value for gesture/cursor
-    // suppression (verified: returning non-zero doesn't stop the system moving the cursor),
-    // and Trident only generates events; letting the system see the raw frames keeps other
+    // Frames are never consumed: the callback's return is void, and Trident only
+    // generates events — letting the system see the raw frames keeps other
     // trackpad behaviors working.
-    return 0
 }
 
 // MARK: - DeviceMonitor
@@ -69,6 +67,10 @@ final class DeviceMonitor: @unchecked Sendable {
     private let stateLock = NSLock()
     private var isRunning = false
     private var registeredDevices: Set<UnsafeMutableRawPointer> = []
+    /// Stable hardware IDs of the registered devices (see `deviceID`), for the
+    /// `deviceListChanged` identity comparison. Fewer entries than
+    /// `registeredDevices` when a device reports no ID.
+    private var registeredDeviceIDs: Set<UInt64> = []
     /// Per-device physical size, keyed by device pointer. Published as a whole under
     /// `gLock` in `start()` and read under the same lock on the callback thread, so a
     /// restart's rebuild can never race an in-flight read. A few entries at most — a
@@ -89,9 +91,18 @@ final class DeviceMonitor: @unchecked Sendable {
     private func physicalSize(of device: UnsafeMutableRawPointer) -> SurfaceSize {
         var w: Int32 = 0
         var h: Int32 = 0
-        MTDeviceGetSensorSurfaceDimensions(device, &w, &h)
-        guard w > 0, h > 0 else { return Self.fallbackSize }
+        guard MTDeviceGetSensorSurfaceDimensions(device, &w, &h) == 0, w > 0, h > 0 else {
+            return Self.fallbackSize
+        }
         return SurfaceSize(widthMM: Float(w) / 100, heightMM: Float(h) / 100)
+    }
+
+    /// The device's stable hardware ID (survives reconnect), or nil when the
+    /// framework can't provide one.
+    private func deviceID(of device: UnsafeMutableRawPointer) -> UInt64? {
+        var id: UInt64 = 0
+        guard MTDeviceGetDeviceID(device, &id) == 0, id != 0 else { return nil }
+        return id
     }
 
     init() {
@@ -110,6 +121,7 @@ final class DeviceMonitor: @unchecked Sendable {
         guard !isRunning else { return true }
 
         registeredDevices.removeAll()
+        registeredDeviceIDs.removeAll()
         // Build the size table locally, then publish it in one shot under `gLock`
         // below — so the callback never sees a half-built table.
         var sizes: [(device: UnsafeMutableRawPointer, size: SurfaceSize)] = []
@@ -126,12 +138,21 @@ final class DeviceMonitor: @unchecked Sendable {
             // under `stateLock`. The wrapper is deliberately leaked: a few dozen
             // bytes per device per engine restart.
             _ = Unmanaged<AnyObject>.fromOpaque(device).retain()
+            MTRegisterContactFrameCallback(device, contactCallback)
+            // A device that won't start can't deliver frames — don't count it as
+            // registered (the device-list check would then treat its later loss as a
+            // change, and the engine would claim a trackpad it never had).
+            let err = MTDeviceStart(device, 0)
+            guard err == 0 else {
+                log.error("MTDeviceStart failed (err \(err)) — skipping this device")
+                MTUnregisterContactFrameCallback(device, contactCallback)
+                return
+            }
             let size = physicalSize(of: device)
             sizes.append((device, size))
             let summary = String(format: "trackpad surface %.1f × %.1f mm", Double(size.widthMM), Double(size.heightMM))
             log.notice("\(summary, privacy: .public)")
-            MTRegisterContactFrameCallback(device, contactCallback)
-            MTDeviceStart(device, 0)
+            if let id = deviceID(of: device) { registeredDeviceIDs.insert(id) }
             registeredDevices.insert(device)
         }
 
@@ -168,9 +189,18 @@ final class DeviceMonitor: @unchecked Sendable {
     /// Whether the set of attached multitouch devices no longer matches what this
     /// monitor registered — a trackpad connected or dropped since `start()` (Trident
     /// would otherwise never read a Magic Trackpad that arrives after launch, or one
-    /// that reconnects after a Bluetooth drop). Count-based: enumeration may hand out
-    /// different wrapper pointers for the same hardware, so pointer identity can't be
-    /// compared across calls. The caller reconciles by restarting the engine.
+    /// that reconnects after a Bluetooth drop). Compared by STABLE hardware ID:
+    /// enumeration may hand out different wrapper pointers for the same hardware, so
+    /// pointer identity can't be compared across calls — and a bare count can't see
+    /// a same-count swap (one trackpad drops, another arrives: count unchanged but
+    /// the engine is left holding a dead handle). The caller reconciles by
+    /// restarting the engine.
+    ///
+    /// Blind spot: a SAME-hardware drop+reconnect inside one poll window shows an
+    /// identical ID set — the dead wrapper is invisible here and only heals on a
+    /// wake restart or a real set change. Wrapper pointers can't help: enumeration
+    /// may hand out fresh pointers for the same hardware, so pointer inequality
+    /// would report "changed" on every tick.
     func deviceListChanged() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -180,6 +210,21 @@ final class DeviceMonitor: @unchecked Sendable {
         // An empty list is indistinguishable from a transient enumeration failure
         // (start() falls back to the default device in that state) — don't flap.
         guard count > 0 else { return false }
+        // Compare stable hardware IDs when every device on both sides reports one;
+        // a device that won't report an ID is invisible to the set comparison, so
+        // fall back to the count check then.
+        var currentIDs = Set<UInt64>()
+        var identifiable = 0
+        for i in 0..<count {
+            guard let raw = CFArrayGetValueAtIndex(list, i) else { continue }
+            if let id = deviceID(of: UnsafeMutableRawPointer(mutating: raw)) {
+                currentIDs.insert(id)
+                identifiable += 1
+            }
+        }
+        if identifiable == count, registeredDeviceIDs.count == registeredDevices.count {
+            return currentIDs != registeredDeviceIDs
+        }
         return count != registeredDevices.count
     }
 
@@ -209,7 +254,8 @@ final class DeviceMonitor: @unchecked Sendable {
             // framework's release-time stop path never runs (same retain), so this is
             // the sole MTDeviceStop. The running check just makes repeated stops inert.
             if MTDeviceIsRunning(device) {
-                MTDeviceStop(device)
+                let err = MTDeviceStop(device)
+                if err != 0 { log.error("MTDeviceStop failed (err \(err)) on a device during teardown") }
             }
         }
     }

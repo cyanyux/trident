@@ -14,7 +14,7 @@ options:
 packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    exactVersion: "2.6.0"
+    exactVersion: "2.9.6"
 
 settings:
   base:

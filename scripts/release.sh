@@ -40,6 +40,52 @@ if [ -n "$(git status --porcelain)" ]; then
   echo "error: working tree is not clean — commit or stash before releasing" >&2
   exit 1
 fi
+
+# The live appcast is served from raw.githubusercontent.com/.../main/appcast.xml, and
+# the publish step pushes HEAD — on any other branch that push updates the WRONG
+# branch, so the release would "succeed" with a feed no client ever sees.
+BRANCH="$(git branch --show-current)"
+if [ "$BRANCH" != "main" ]; then
+  echo "error: releases must be cut from main (currently on '${BRANCH:-<detached>}')" >&2
+  exit 1
+fi
+
+# Marketing-version sanity: it lands verbatim in CFBundleShortVersionString, the tag
+# name, and the enclosure filenames — reject typos like "v1.2" or a commit SHA early.
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "error: '$VERSION' doesn't look like a version (expected e.g. 1.2 or 1.2.3)" >&2
+  exit 1
+fi
+
+# The tag/release must be genuinely NEW — checked in all three places a re-run could
+# collide. Without this, a collision surfaced mid-publish, and the rollback then
+# deleted the LIVE release and remote tag while main's appcast still advertised
+# them: every install's update feed 404'd until the next release.
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+  echo "error: tag $TAG already exists locally — pick a new version" >&2
+  exit 1
+fi
+# ls-remote patterns match the ref tail exactly (no regex), so a v1.2 can't
+# false-match v1.20 or a stray "v1x2" tag.
+if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+  echo "error: tag $TAG already exists on origin — pick a new version" >&2
+  exit 1
+fi
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  echo "error: GitHub Release $TAG already exists — pick a new version" >&2
+  exit 1
+fi
+
+# Releasing an ad-hoc-signed build is unrecoverable for users: the signature changes
+# every build, orphaning every install's Accessibility grant and login-item
+# registration. build.sh only warns and falls back — so the stable identity (cert
+# AND a usable private key, which find-identity -v requires) is a hard gate here.
+if ! security find-identity -v -p codesigning | grep -q '"Trident Dev"'; then
+  echo "error: 'Trident Dev' signing identity (cert + key) not found —" >&2
+  echo "       run ./scripts/setup-signing.sh first." >&2
+  exit 1
+fi
+
 # Exact commit to roll back to if the publish phase fails partway. Safe to hard-reset
 # onto: the clean-tree check above guarantees there's no unrelated work to lose.
 START_REF="$(git rev-parse HEAD)"
@@ -53,11 +99,12 @@ ensure_sparkle_tools "$ROOT"
 # --- version bump (marketing version from arg; build number auto-increments) ---
 OLD_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")"
 NEW_BUILD=$((OLD_BUILD + 1))
-# If anything between here and the commit fails (e.g. the build), restore Info.plist
-# so a failed release doesn't leave a half-bumped version dirtying the tree — which
-# the clean-tree preflight above would then block on the next attempt. Cleared once
-# the bump is safely committed.
-trap 'git checkout -- "$INFO" 2>/dev/null || true' ERR
+# If anything between here and the publish phase fails (build, packaging,
+# appcast, commit, tag), reset the worktree to the pre-release commit: the
+# version bump, appcast regeneration, a made commit, and a made local tag all
+# disappear — the clean-tree and existing-tag preflights would otherwise block
+# every retry. Superseded by publish_failed once remote state is in play.
+trap 'git tag -d "$TAG" 2>/dev/null || true; git reset --hard "$START_REF" 2>/dev/null || true' ERR
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$INFO"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_BUILD" "$INFO"
 echo "==> Releasing Trident $VERSION (build $NEW_BUILD)"
@@ -80,7 +127,7 @@ ditto -c -k --keepParent "$APP" "$ZIP"
 # (regenerate via scripts/render-dmg-background.sh if you move things).
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/Trident.app"
-create-dmg \
+if ! create-dmg \
   --volname "Trident" \
   --volicon "$APP/Contents/Resources/AppIcon.icns" \
   --background assets/dmg-background.tiff \
@@ -91,8 +138,19 @@ create-dmg \
   --icon "Trident.app" 165 195 \
   --hide-extension "Trident.app" \
   --app-drop-link 495 195 \
-  "$DMG" "$STAGE"
+  "$DMG" "$STAGE"; then
+  rm -rf "$STAGE"   # create-dmg leaves the staging copy behind on failure
+  false             # plain `exit` bypasses the ERR trap; a failure triggers it
+fi
 rm -rf "$STAGE"
+
+# Smoke-test the EdDSA private key BEFORE anything publishes: generate_appcast would
+# fail on a missing key anyway, but only after mutating appcast.xml — sign_update
+# fails cleanly here instead. (Its output is discarded; the appcast re-signs itself.)
+if ! "$SPARKLE_BIN/sign_update" "$ZIP" >/dev/null; then
+  echo "error: update signing failed — run ./scripts/setup-sparkle-keys.sh first" >&2
+  false   # triggers the ERR trap (plain exit would skip the reset)
+fi
 
 # --- appcast ---------------------------------------------------------------
 # generate_appcast reads the version from the app inside the ZIP, signs the ZIP
@@ -115,19 +173,29 @@ git tag "$TAG"
 # new appcast (served from main) never went live — so clients never see the update,
 # and a naive re-run trips the clean-tree / existing-tag preflights. This trap rolls
 # the remote AND local state back to exactly where we started, so a re-run is clean.
+# The remote deletes are gated by live existence checks, not flags: `gh release
+# create` can create the Release and then fail mid-upload, leaving a flag unset
+# for an artifact that exists. The preflight proved no tag/release existed when
+# the run started, so anything found here is ours to remove. `|| true` on every
+# delete — a network outage is the likeliest reason we're here, and a failed
+# remote delete must not kill the local cleanup under set -e.
 publish_failed() {
   local rc=$?
   echo >&2
   echo "error: release publish failed (exit $rc) — rolling back to the pre-release state." >&2
-  gh release delete "$TAG" --repo "$REPO" --yes 2>/dev/null || true  # remove a created Release
-  git push origin ":refs/tags/$TAG" 2>/dev/null || true             # remove a pushed tag
-  git tag -d "$TAG" 2>/dev/null || true                             # remove the local tag
+  if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    gh release delete "$TAG" --repo "$REPO" --yes 2>/dev/null || true
+  fi
+  if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+    git push origin ":refs/tags/$TAG" 2>/dev/null || true
+  fi
+  git tag -d "$TAG" 2>/dev/null || true                             # local tag — always ours
   git reset --hard "$START_REF" 2>/dev/null || true                 # undo the release commit + bump
   echo "Rolled back. Fix the cause (gh auth / network / 'git pull' for fast-forward)," >&2
   echo "then re-run: ./scripts/release.sh $VERSION" >&2
   exit 1
 }
-trap publish_failed ERR   # supersedes the Info.plist-restore trap; the bump is committed now
+trap publish_failed ERR   # supersedes the reset trap; the bump is committed now
 
 # Publish in an order that never advertises a download before it exists. The live
 # feed is SUFeedURL → raw.githubusercontent.com/.../main/appcast.xml, i.e. served
@@ -140,7 +208,7 @@ gh release create "$TAG" "$DMG" "$ZIP" \
   --repo "$REPO" \
   --title "Trident $VERSION" \
   --generate-notes
-git push origin HEAD
+git push origin HEAD:main   # explicit: the appcast only goes live on main
 trap - ERR   # fully published — nothing left to roll back
 
 echo

@@ -27,11 +27,14 @@ final class MenuBarController: NSObject {
     private let onCheckForUpdates: () -> Void
     private let onShowOnboarding: () -> Void
     private let onOpenAccessibility: () -> Void
+    private let onOpenInputMonitoring: () -> Void
+    private let onMenuWillOpen: () -> Void
     private let onQuit: () -> Void
 
     // Plain menu items (info / navigation — fine for these to dismiss the menu).
     private let statusLine = NSMenuItem()
     private let accessibilityItem = NSMenuItem()
+    private let inputMonitoringItem = NSMenuItem()
 
     // Controls inside the embedded panel, kept for state updates.
     private let panel = NSStackView()
@@ -64,6 +67,8 @@ final class MenuBarController: NSObject {
         onCheckForUpdates: @escaping () -> Void,
         onShowOnboarding: @escaping () -> Void,
         onOpenAccessibility: @escaping () -> Void,
+        onOpenInputMonitoring: @escaping () -> Void,
+        onMenuWillOpen: @escaping () -> Void,
         onQuit: @escaping () -> Void
     ) {
         self.onToggleEnabled = onToggleEnabled
@@ -79,6 +84,8 @@ final class MenuBarController: NSObject {
         self.onCheckForUpdates = onCheckForUpdates
         self.onShowOnboarding = onShowOnboarding
         self.onOpenAccessibility = onOpenAccessibility
+        self.onOpenInputMonitoring = onOpenInputMonitoring
+        self.onMenuWillOpen = onMenuWillOpen
         self.onQuit = onQuit
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
@@ -112,6 +119,13 @@ final class MenuBarController: NSObject {
         accessibilityItem.action = #selector(openAccessibility)
         menu.addItem(accessibilityItem)
 
+        // Hidden unless Input Monitoring is denied — raw trackpad frames travel
+        // the IOHID path and macOS 26.3+ gates them on it (see InputMonitoring).
+        inputMonitoringItem.target = self
+        inputMonitoringItem.action = #selector(openInputMonitoring)
+        inputMonitoringItem.isHidden = true
+        menu.addItem(inputMonitoringItem)
+
         menu.addItem(.separator())
 
         // HIG: trailing ellipsis on commands that open a window needing further
@@ -134,6 +148,10 @@ final class MenuBarController: NSObject {
         quit.target = self
         menu.addItem(quit)
 
+        // Refresh on open: the poll's slow cadence means externally-changed state
+        // (a Login Items toggle in System Settings, an idle revoke) can be ~30 s
+        // stale — reprobing here makes every open show current truth.
+        menu.delegate = self
         statusItem.menu = menu
     }
 
@@ -274,7 +292,14 @@ final class MenuBarController: NSObject {
     /// bitmap, NOT an SF Symbol: menu items render symbol images as templates —
     /// tinted to the menu's text color, palette configuration ignored — which made a
     /// colored `circle.fill` invisible against the menu background.
-    private func statusDot(_ color: NSColor) -> NSImage {
+    /// Cached: `update()` runs on every slider tick during a live drag, so a fresh
+    /// bitmap per call was pure allocation churn for four fixed colors.
+    private lazy var statusDotPending = Self.makeStatusDot(.systemOrange)
+    private lazy var statusDotActive = Self.makeStatusDot(.systemGreen)
+    private lazy var statusDotOff = Self.makeStatusDot(.systemGray)
+    private lazy var statusDotAttention = Self.makeStatusDot(.systemRed)
+
+    private static func makeStatusDot(_ color: NSColor) -> NSImage {
         let image = NSImage(size: NSSize(width: 10, height: 10), flipped: false) { rect in
             color.setFill()
             NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
@@ -316,20 +341,27 @@ final class MenuBarController: NSObject {
         swipeDistanceMM: Float,
         palmEdgeBandMM: Float,
         hapticFeedback: Bool,
-        launchAtLogin: Bool
+        launchAtLogin: Bool,
+        inputMonitoringDenied: Bool
     ) {
         if !accessibilityGranted {
             statusLine.title = "Needs Accessibility permission"
-            statusLine.image = statusDot(.systemOrange)
+            statusLine.image = statusDotPending
+        } else if inputMonitoringDenied {
+            // Accessibility is granted but raw trackpad frames are gated on Input
+            // Monitoring (macOS 26.3+): the engine "runs" while receiving zero
+            // frames — surface it rather than leaving the failure invisible.
+            statusLine.title = "Needs Input Monitoring permission"
+            statusLine.image = statusDotPending
         } else if running {
             statusLine.title = "Active"
-            statusLine.image = statusDot(.systemGreen)
+            statusLine.image = statusDotActive
         } else if !enabled {
             statusLine.title = "Paused"
-            statusLine.image = statusDot(.systemGray)
+            statusLine.image = statusDotOff
         } else {
             statusLine.title = "Inactive"   // enabled + permitted but no trackpad responding
-            statusLine.image = statusDot(.systemRed)
+            statusLine.image = statusDotAttention
         }
 
         enabledButton.state = enabled ? .on : .off
@@ -359,9 +391,13 @@ final class MenuBarController: NSObject {
         accessibilityItem.title = accessibilityGranted
             ? "Accessibility: Granted"
             : "Grant Accessibility Permission…"
+        inputMonitoringItem.isHidden = !inputMonitoringDenied
+        inputMonitoringItem.title = "Grant Input Monitoring Permission…"
 
         if let button = statusItem.button {
-            button.appearsDisabled = !(accessibilityGranted && enabled)
+            // Dimmed whenever the app can't actually deliver: off, no Accessibility,
+            // or an Input Monitoring denial (the raw-frame feed is dead then too).
+            button.appearsDisabled = !(accessibilityGranted && enabled && !inputMonitoringDenied)
         }
     }
 
@@ -379,7 +415,12 @@ final class MenuBarController: NSObject {
     @objc private func resetPalmTapped() { onResetPalm() }
     @objc private func quit() { onQuit() }
     @objc private func openAccessibility() { onOpenAccessibility() }
+    @objc private func openInputMonitoring() { onOpenInputMonitoring() }
 
     @objc private func swipeChanged(_ sender: NSSlider) { onSetSwipeDistance(sender.floatValue) }
     @objc private func palmChanged(_ sender: NSSlider) { onSetPalmEdgeBand(sender.floatValue) }
+}
+
+extension MenuBarController: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) { onMenuWillOpen() }
 }

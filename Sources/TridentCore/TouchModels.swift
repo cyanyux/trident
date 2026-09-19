@@ -36,15 +36,24 @@ struct MTTouch {
     var zDensity: Float
 }
 
-/// Touch lifecycle states reported by the framework. Only `.touching` and
-/// `.active` represent a finger physically resting on the trackpad, so those are
-/// the only states Trident counts as real contacts.
+/// Touch lifecycle states reported by the framework (`MTTouchState`). Three
+/// states mean a finger is physically on the surface: make-touch (3, contact
+/// begins), touching (4, active contact), and break-touch (5, beginning to lift —
+/// and also what a hard-landing/Force-Touch contact reports while still down).
+/// States 1–2 are approach/hover, 6–7 lift-off/out-of-range — not contact. The
+/// 3–5 range matches what other MultitouchSupport consumers verified on-device
+/// on macOS 26.3+: a contact counted through break-touch keeps a finger that
+/// presses hard mid-gesture from phantom-lifting (which would drop the count to
+/// two and prematurely commit a swipe).
 enum TouchState {
-    static let touching: UInt32 = 3
-    static let active: UInt32 = 4
+    // Names match the canonical `MTTouchState` enum in the framework's headers:
+    // MTTouchStateMakeTouch (3), MTTouchStateTouching (4), MTTouchStateBreakTouch (5).
+    static let makeTouch: UInt32 = 3
+    static let touching: UInt32 = 4
+    static let breakTouch: UInt32 = 5
 
     /// Whether a raw `state` value counts as a finger on the surface.
     static func isContact(_ state: UInt32) -> Bool {
-        state == touching || state == active
+        (makeTouch...breakTouch).contains(state)
     }
 }

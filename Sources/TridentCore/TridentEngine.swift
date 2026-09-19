@@ -23,6 +23,13 @@ public final class TridentEngine: @unchecked Sendable {
     /// The app layer uses this for optional haptic feedback.
     public var onActionPerformed: ((TridentAction) -> Void)?
 
+    /// Invoked on the tap's run-loop thread when the system force-disables the
+    /// event tap — the shape an Accessibility revoke takes mid-gesture. The app
+    /// layer hops to main and reprobes so the dead engine is reflected instantly
+    /// rather than on the next poll tick. Set before `start()`; read lazily via
+    /// the forwarding closure, so post-start reassignment still takes effect.
+    public var onTapForceDisabled: (() -> Void)?
+
     public init() {
         // Recognizer emits intents; synthesizer turns them into events. Both
         // closures are set once here, before any frame can arrive.
@@ -38,9 +45,21 @@ public final class TridentEngine: @unchecked Sendable {
             case .swipeStep:
                 self?.onActionPerformed?(.appSwitchStep)
             case .swipeCommit, .cancel:
-                suppressor.setCursorFreeze(false)
+                // The unfreeze is NOT done here: it runs on the synthesizer's serial
+                // queue via `onCommandReleased`, after the ⌘-up (or cancel Escape)
+                // has actually posted. Unfreezing the moment the action fires —
+                // before the queued release executes — opened a window where the
+                // HUD was still up but cursor motion was no longer swallowed, so a
+                // drifting cursor could hijack the selection at the last instant.
+                break
             }
         }
+        // Lift the cursor freeze only once the held-⌘ lifecycle has fully settled
+        // on the serial event queue — i.e. strictly after the release posts.
+        synthesizer.onCommandReleased = { [suppressor] in
+            suppressor.setCursorFreeze(false)
+        }
+        suppressor.onTapForceDisabled = { [weak self] in self?.onTapForceDisabled?() }
         // While three fingers are down (and briefly after), block the native
         // left/right clicks an uneven tap could otherwise leak.
         recognizer.onGestureActiveChanged = { [suppressor] active in
@@ -53,11 +72,22 @@ public final class TridentEngine: @unchecked Sendable {
             suppressor.noteFrame()
             recognizer.process(touches, count: count, timestamp: timestamp,
                                widthMM: widthMM, heightMM: heightMM)
+            // Known limitation: every device's frames merge into this ONE recognizer
+            // (the callback carries no device identity, and suppression state is global
+            // anyway). The processLock serialization makes that memory-safe, but frames
+            // from two pads touched simultaneously still interleave into one touch set —
+            // a contact ending on pad B can read as a lift mid-gesture on pad A, and a
+            // zero-contact frame from pad B wipes pad A's parked/evidence latches.
+            // Rare in practice (a pad emits frames only while touched, and few users
+            // gesture on two trackpads at once); a true fix is per-device recognizers
+            // keyed off the callback's device, which DeviceMonitor doesn't currently
+            // thread through.
         }
     }
 
     /// Start reading the trackpad. Returns `false` if no multitouch device exists.
-    /// Must be called on the main thread (the suppressor taps the main run loop).
+    /// Must be called on the main thread — it serializes start/stop ordering and the
+    /// suppressor spawns its own dedicated run-loop thread internally.
     @discardableResult
     public func start() -> Bool {
         // A previous run may have stopped mid-gesture; clear any stale phase before
@@ -66,9 +96,25 @@ public final class TridentEngine: @unchecked Sendable {
         // stop() closed.
         synthesizer.prepare()
         recognizer.resetState()
-        let started = monitor.start()
+        // The suppressor starts BEFORE the monitor: it opens the suppression epoch so
+        // the very first frames can't set suppression state into a not-yet-created tap
+        // (under the old order a frame landing between monitor.start and suppressor.start
+        // had its suppression silently dropped). If no device exists the suppressor is
+        // torn straight back down — otherwise a thread + tap would sit idle forever,
+        // since engineRunning stays false and stop() never cleans it up.
         suppressor.start()
+        let started = monitor.start()
+        if !started { suppressor.stop() }
         return started
+    }
+
+    /// Tell the pipeline that Accessibility permission was (probably) just lost —
+    /// called by the app layer when its live probe reports a revoke, before `stop()`.
+    /// Releases posted after a revoke are silently dropped, so a ⌘ this run pressed
+    /// may still be down; the synthesizer marks it maybe-stuck and the next `start()`
+    /// re-posts the finishers once permission is back.
+    public func notePermissionLost() {
+        synthesizer.notePermissionLost()
     }
 
     /// Stop reading the trackpad, remove the event tap, and release any held modifier.

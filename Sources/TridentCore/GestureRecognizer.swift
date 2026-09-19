@@ -54,10 +54,15 @@ enum GestureAction: Sendable, Equatable {
 
 /// Three-finger tap and horizontal-swipe state machine.
 ///
-/// `process(_:count:timestamp:)` runs on the framework callback thread and is the
-/// hot path: it reads the live touch buffer in place, allocates nothing, and takes
-/// no locks except a single uncontended read of the swipe threshold. All mutable
-/// state is touched only on that thread; `onAction` is set once before `start()`.
+/// `process(_:count:timestamp:)` runs on the framework's per-device callback
+/// threads and is the hot path: it reads the live touch buffer in place and
+/// allocates nothing. MultitouchSupport calls back on a DIFFERENT thread per
+/// device, so with two trackpads (built-in + Magic Trackpad) two frames can be
+/// in flight at once — all mutable state is serialized behind `processLock`,
+/// which `resetState()` takes too, so a restart can't clear state underneath an
+/// in-flight frame. The lock is held for microseconds and never while calling
+/// out to code that could re-enter it. `onAction`/`onGestureActiveChanged` are
+/// invoked under it, from whichever device thread delivered the frame.
 final class GestureRecognizer: @unchecked Sendable {
 
     // Tap timing — a tap is a brief, near-stationary three-finger contact.
@@ -79,14 +84,40 @@ final class GestureRecognizer: @unchecked Sendable {
     ///     fingertips merge — laundering all the motion evidence through re-anchors;
     ///   • the palm filter hid the pinching thumb from the centroid entirely.
     /// Per-path travel can't be laundered (the anchor never moves while the touch
-    /// lives) and the thumb's own travel counts. 4 mm sits above a firm tap's
-    /// landing skid but far below any pinch finger's travel.
+    /// lives, except the one deliberate re-base when parking is earned) and the
+    /// thumb's own travel counts. 4 mm sits above a firm tap's landing skid but
+    /// far below any pinch finger's travel.
     private let tapPathTravelCancelMM: Float = 4.0
+    /// Per-frame movement below this (mm) counts as still — resting-thumb jitter is
+    /// sub-millimetre, a real finger in a gesture moves more.
+    private let stillnessEps: Float = 1.0
+    /// Still frames at ~125 Hz before a rim contact settles into a parked thumb —
+    /// ~64 ms. Parking is earned by this much consecutive stillness inside the band.
+    private let parkSettleFrames: Int = 8
+    /// Displacement over a still window that counts as movement evidence: a window
+    /// reaching this is dirty (the evidence latch stays or sets); a full window
+    /// under it is clean (the latch releases, parking can be earned). ~0.09 mm per
+    /// frame over `parkSettleFrames` — roughly a 12 mm/s drift at 125 Hz — so any
+    /// creep at gesture-relevant speed trips it while resting jitter (~0.3 mm of
+    /// wander, not sustained one-way displacement) does not.
+    private let streakEvidenceMM: Float = 0.75
     /// A path index absent longer than this many frames is a NEW touch when it
     /// reappears (the framework recycles path slots): re-anchor it rather than
     /// charging it with travel that spans two different touches. Short enough to
     /// bridge a one-or-two-frame sensor dropout mid-pinch without re-anchoring.
     private let pathGapFrames = 8
+
+    /// A single touch path already beyond this travel when a gesture is born means
+    /// a finger was DOWN AND MOVING before three contacts were ever present — the
+    /// signature of a two-finger scroll (Safari back/forward, a horizontal
+    /// scrollbar) whose remaining finger two fresh contacts just joined. One is
+    /// enough: the gesture bars its swipe for life (like `bornInSystemGestureTail`)
+    /// because the accumulated scroll travel would otherwise carry straight over
+    /// the step threshold and fire a phantom ⌘Tab. A real three-finger swipe arms
+    /// within a frame or two of landing, so its paths read ~0; even a fast flick's
+    /// staggered landing can't put a path past 30 mm before the arm. An edge-band
+    /// start sweeps out of a ≤15 mm band, also under the bound.
+    private let bornScrollTravelMM: Float = 30
 
     /// After 4+ fingers are seen (a system gesture: Launchpad, show desktop, Mission
     /// Control, a Spaces swipe) or a gesture ends abnormally (the sub-3 dwell bound, a
@@ -181,12 +212,15 @@ final class GestureRecognizer: @unchecked Sendable {
         pathAnchors.reserveCapacity(16)   // hot path never grows it
     }
 
-    /// Sink for recognized actions. Invoked on the callback thread.
+    /// Sink for recognized actions. Invoked on the callback thread (whichever
+    /// device delivered the frame), under `processLock`.
     var onAction: ((GestureAction) -> Void)?
 
     /// Fires `true` the moment three fingers are down and `false` when the gesture
-    /// ends (whatever the outcome). Drives the event suppressor that blocks stray
-    /// native clicks. Invoked on the callback thread.
+    /// ends (whatever the outcome) — and also when a gesture outlives the tap
+    /// window, since only tap-like contacts can make macOS synthesize a click.
+    /// Drives the event suppressor that blocks stray native clicks. Invoked on
+    /// the callback thread, under `processLock`.
     var onGestureActiveChanged: ((Bool) -> Void)?
 
     /// Horizontal travel, in millimetres, required to trigger one app-switch step.
@@ -209,20 +243,54 @@ final class GestureRecognizer: @unchecked Sendable {
         }
     }
 
-    // MARK: State (callback-thread only)
+    // MARK: State (`processLock` only)
+
+    /// Serializes every frame's state access — the framework can invoke the
+    /// contact callback on a different thread PER DEVICE, so two trackpads can
+    /// deliver frames concurrently. Uncontended in the common single-device case;
+    /// held for microseconds either way. Also taken by `resetState()` so an
+    /// engine restart can't clear state underneath an in-flight frame.
+    private let processLock = NSLock()
 
     private enum Phase { case idle, tracking, swiping }
     private var phase: Phase = .idle
     private var anchorX: Float = 0
     private var anchorY: Float = 0
-    /// Where each live touch path first landed (see `tapPathTravelCancelMM`).
+    /// Where each live touch path first landed or last parked (see
+    /// `tapPathTravelCancelMM` and `notePathTravel`).
     /// A handful of entries at most — linear scans are free. The buffer's capacity is
     /// reserved once; clears keep it, so the hot path never allocates.
     private struct PathAnchor {
         var id: Int32
         var x: Float
         var y: Float
+        var lastX: Float
+        var lastY: Float
+        /// Where the current still streak began — displacement from here, not the
+        /// frame count alone, decides whether a contact is truly "settled" (a
+        /// uniform sub-eps creep racks up stillFrames while physically moving).
+        var stillX: Float
+        var stillY: Float
         var lastSeenFrame: Int
+        /// Consecutive frames with per-frame movement below `stillnessEps`.
+        var stillFrames: Int
+        /// Latched resting-thumb flag. Earned ONLY by proof — a full clean still
+        /// window inside the edge band while a gesture is starting — or carried
+        /// across a one-frame sensor flicker (gap ≤ 2). Re-earned the same way on
+        /// every clean window, so a parked contact that re-seats slides its
+        /// anchor. Never granted at landing: an unproven band landing is
+        /// indistinguishable from a system-gesture straggler, so it must re-prove
+        /// like everything else. A contact that lands in the band MID-gesture can
+        /// never park.
+        var parked: Bool
+        /// Quarantine-evidence latch for a FILTERED contact. Set by any movement
+        /// evidence — a supra-eps frame, `streakEvidenceMM` of window displacement,
+        /// or (re)appearing mid-gesture — and cleared ONLY by a full clean window
+        /// (`parkSettleFrames` consecutive still frames whose total displacement
+        /// stayed under the bound). A latch, not a per-frame reading: otherwise a
+        /// slow uniform creep would amnesty itself between measurement windows,
+        /// leaving gaps wide enough for a pending swipe to complete in.
+        var movingEvidence: Bool
     }
     private var pathAnchors: [PathAnchor] = []
     /// Monotone frame counter for `PathAnchor.lastSeenFrame` / `pathGapFrames`.
@@ -257,11 +325,25 @@ final class GestureRecognizer: @unchecked Sendable {
     private var swipeQuarantineUntil: Double = 0
     /// Consecutive frames seen with fewer than three contacts while swiping (debounce).
     private var lowFrameCount: Int = 0
+    /// Whether the click-suppression latch is currently held for this gesture.
+    /// Released early once a gesture can no longer be a tap (see `handleTracking`),
+    /// re-latched if a swipe confirms.
+    private var suppressionLatched = false
 
     // MARK: Hot path
 
+    /// Serialized entry point — the framework may call back on a different thread
+    /// per device, so two frames can be in flight at once on multi-trackpad Macs.
     func process(_ touches: UnsafePointer<MTTouch>, count: Int, timestamp: Double,
                  widthMM: Float, heightMM: Float) {
+        processLock.lock()
+        defer { processLock.unlock() }
+        processLocked(touches, count: count, timestamp: timestamp,
+                      widthMM: widthMM, heightMM: heightMM)
+    }
+
+    private func processLocked(_ touches: UnsafePointer<MTTouch>, count: Int, timestamp: Double,
+                               widthMM: Float, heightMM: Float) {
         let cfg = config.withLock { $0 }
 
         // If the stream stalled and resumed, abandon any in-flight gesture instead of
@@ -288,58 +370,99 @@ final class GestureRecognizer: @unchecked Sendable {
 
         // One pass: centroid of valid (non-palm) contacts, plus per-path travel for
         // EVERY contact — palm-rejected ones included, so a pinching thumb the palm
-        // filter hides still disqualifies a tap. Tight and allocation-free.
+        // filter hides still disqualifies a tap. Two contact counts are kept:
+        //   • `physical` — every contact on the surface before the palm filter.
+        //   • `quarantineCount` — what the system-gesture quarantine keys on: an
+        //     UNFILTERED contact always counts, but a palm-filtered one counts only
+        //     while its evidence latch is up — it moved recently (a supra-eps
+        //     frame, `streakEvidenceMM` of window displacement, or appearing
+        //     mid-gesture) and hasn't yet proven stillness with a full clean
+        //     window. A filtered contact that simply SITS — resting thumb, resting
+        //     palm heel — is no evidence: counting it barred all gestures for
+        //     users who park a thumb at the pad's rim. A real fourth finger (the
+        //     phantom-⌘Tab vector: oversized from a hard press, or landing inside
+        //     the edge band) is always in motion while a system gesture is in
+        //     flight, so the latch exposes it every frame.
+        // Tight and allocation-free.
         frameIndex &+= 1
         var sumX: Float = 0
         var sumY: Float = 0
         var valid = 0
-        var anyContact = false
+        var physical = 0
+        var quarantineCount = 0
+        var scrollBornPaths = 0
         var maxPathTravelMM: Float = 0
         for i in 0..<count {
             let t = touches[i]
             guard TouchState.isContact(t.state) else { continue }
-            anyContact = true
+            physical += 1
             let p = t.normalizedVector.position
-            let travel = notePathTravel(id: t.pathIndex, position: p,
-                                        widthMM: widthMM, heightMM: heightMM)
+            let atBand = inEdgeBand(p, edgeBandMM: cfg.palmEdgeBandMM,
+                                    widthMM: widthMM, heightMM: heightMM)
+            let (travel, parked, moving) = notePathTravel(
+                id: t.pathIndex, position: p, inBand: atBand, canPark: entering,
+                widthMM: widthMM, heightMM: heightMM)
             if travel > maxPathTravelMM { maxPathTravelMM = travel }
-            if isPalm(position: p, size: t.zTotal, edgeBandMM: cfg.palmEdgeBandMM,
-                      maxSize: cfg.palmMaxSize, widthMM: widthMM, heightMM: heightMM,
-                      applyEdgeBand: entering) {
-                continue
+            if travel > bornScrollTravelMM { scrollBornPaths += 1 }
+            // A contact is filtered OUT of the gesture's set when it's a palm:
+            //   • oversized right now (re-checked every frame — a palm heel stays
+            //     filtered however long it rests), or
+            //   • a path PARKED at the rim — proven still there for a beat while
+            //     idle — the resting thumb. The latch is earned at idle only (a
+            //     mid-gesture band landing is a straggler, never a thumb), persists
+            //     while the contact never flickers out for more than a frame and
+            //     never drifts 4 mm from where it parked, and dies the moment it
+            //     does either — supra-eps movement kills it on the spot.
+            //   • currently inside the band while a gesture is only just starting
+            //     (the band's original job — rim contacts are filtered at birth).
+            let palm = t.zTotal > cfg.palmMaxSize || parked || (entering && atBand)
+            if !palm {
+                sumX += p.x
+                sumY += p.y
+                valid += 1
             }
-            sumX += p.x
-            sumY += p.y
-            valid += 1
+            // Quarantine evidence: every unfiltered contact counts; a filtered one
+            // counts only while it's behaving like a finger (see `moving` in
+            // notePathTravel — moving, or travelled and not settled back). A
+            // filtered contact that simply SITS (resting thumb, resting palm
+            // heel) is no evidence of a four-finger system gesture.
+            if !palm || moving { quarantineCount += 1 }
         }
         // All touches gone: the next landing is a new story — drop the path anchors.
         // (Keeps capacity, so this never allocates on re-fill.)
-        if !anyContact { pathAnchors.removeAll(keepingCapacity: true) }
+        if physical == 0 { pathAnchors.removeAll(keepingCapacity: true) }
         let cx = valid > 0 ? sumX / Float(valid) : 0
         let cy = valid > 0 ? sumY / Float(valid) : 0
 
         switch phase {
         case .idle:
-            if valid >= 4 {
+            if quarantineCount >= 4 {
                 // A system gesture is in flight. Refreshing the quarantine every frame
                 // extends it to 0.3 s past the LAST 4-finger sighting, so the gesture's
                 // three-contact tail is quarantined however it lands. Without this, a
                 // four-finger Spaces swipe whose fingers all land in the same frame never
                 // passes through .tracking — the only place the quarantine was armed —
                 // and its tail could tap or (worse) fire a phantom ⌘Tab app-switch.
+                // Keyed on QUARANTINE-counted contacts: a fourth finger the palm filter
+                // rejects (oversized from a hard press, or inside the edge band) still
+                // makes this a four-finger contact set the OS can read as a system
+                // gesture — but only once it's moving, so a resting thumb doesn't
+                // quarantine the pad forever.
                 // (The reverse direction — a 4th finger landing AFTER three armed a
                 // clean gesture — is covered by the `entryConfirmDelay` hold.)
                 quarantineFourFingerSighting(at: timestamp)
             } else if valid == 3, cfg.middleClickEnabled || cfg.appSwitchEnabled {
                 // Only arm a gesture when at least one mapping can actually fire; otherwise
                 // three fingers would needlessly drive the click suppressor for no benefit.
-                beginTracking(cx: cx, cy: cy, maxPathTravelMM: maxPathTravelMM, timestamp: timestamp)
+                beginTracking(cx: cx, cy: cy, maxPathTravelMM: maxPathTravelMM,
+                              scrollBornPaths: scrollBornPaths, timestamp: timestamp)
             }
         case .tracking:
-            handleTracking(valid: valid, cx: cx, cy: cy, maxPathTravelMM: maxPathTravelMM,
+            handleTracking(quarantineCount: quarantineCount, valid: valid, cx: cx, cy: cy,
+                           maxPathTravelMM: maxPathTravelMM,
                            timestamp: timestamp, config: cfg, widthMM: widthMM, heightMM: heightMM)
         case .swiping:
-            handleSwiping(valid: valid, cx: cx, cy: cy, timestamp: timestamp,
+            handleSwiping(quarantineCount: quarantineCount, valid: valid, cx: cx, cy: cy, timestamp: timestamp,
                           distanceMM: cfg.swipeDistanceMM, widthMM: widthMM, heightMM: heightMM)
         }
         lastValidCount = valid
@@ -347,22 +470,115 @@ final class GestureRecognizer: @unchecked Sendable {
 
     // MARK: Phases
 
-    /// Look up (or anchor) a touch path and return how far it has travelled, in mm,
-    /// since it first landed. A path slot unseen for more than `pathGapFrames` is a
-    /// recycled index — a new touch — and is re-anchored at zero travel.
-    private func notePathTravel(id: Int32, position p: MTPoint,
-                                widthMM: Float, heightMM: Float) -> Float {
+    /// Look up (or anchor) a touch path and return (cumulative travel in mm, parked,
+    /// "behaving like an active finger"). `canPark` is true only while a gesture is
+    /// starting — parking is an idle-time latch a contact must EARN by settling,
+    /// so a system-gesture straggler landing in the band mid-gesture always counts
+    /// as a fourth finger. `moving` is the quarantine evidence a FILTERED contact
+    /// provides: it moved this frame, or it has crept far enough over its current
+    /// still streak that it isn't settled — a parked or oversized contact that
+    /// truly sits is no evidence.
+    private func notePathTravel(id: Int32, position p: MTPoint, inBand: Bool, canPark: Bool,
+                                widthMM: Float, heightMM: Float)
+        -> (travel: Float, parked: Bool, moving: Bool) {
         for i in pathAnchors.indices where pathAnchors[i].id == id {
-            if frameIndex - pathAnchors[i].lastSeenFrame > pathGapFrames {
-                pathAnchors[i] = PathAnchor(id: id, x: p.x, y: p.y, lastSeenFrame: frameIndex)
-                return 0
+            var a = pathAnchors[i]
+            let gap = frameIndex - a.lastSeenFrame
+            if gap > pathGapFrames {
+                // Recycled slot — treat as a fresh landing (same rule as below).
+                a = PathAnchor(id: id, x: p.x, y: p.y, lastX: p.x, lastY: p.y,
+                               stillX: p.x, stillY: p.y, lastSeenFrame: frameIndex,
+                               stillFrames: 0, parked: false, movingEvidence: !canPark)
+                pathAnchors[i] = a
+                return (0, false, !canPark)
             }
-            pathAnchors[i].lastSeenFrame = frameIndex
-            return hypotf((p.x - pathAnchors[i].x) * widthMM,
-                          (p.y - pathAnchors[i].y) * heightMM)
+            if gap > 2 {
+                // Missing more than one frame — a re-landing, not a flicker. The
+                // parked latch is dropped outright: even a band re-landing must
+                // re-prove itself, so a recycled identity can't inherit parked
+                // status. The evidence latch is NOT dropped — a re-landing
+                // mid-gesture reads exactly like a fresh straggler below.
+                a.stillFrames = 0
+                a.stillX = p.x
+                a.stillY = p.y
+                a.parked = false
+            }
+            // gap <= 2 is a continuing contact: a one-frame dropout is routine
+            // sensor flicker at the rim — the latches AND the still streak survive
+            // untouched so it can't read as a phantom fourth finger.
+            let delta = hypotf((p.x - a.lastX) * widthMM, (p.y - a.lastY) * heightMM)
+            let streakMoved = hypotf((p.x - a.stillX) * widthMM, (p.y - a.stillY) * heightMM)
+            // Quarantine evidence is a LATCH, not a per-frame reading: once a
+            // contact moves — a supra-eps frame, streakEvidenceMM of window
+            // displacement, or (re)appearing mid-gesture — it keeps counting until
+            // a full clean window proves it stopped. Otherwise a slow uniform
+            // creep would amnesty itself between measurement windows, leaving
+            // gaps a pending swipe could complete inside.
+            var moving = a.movingEvidence || delta >= stillnessEps
+                || streakMoved >= streakEvidenceMM || (gap > 2 && !canPark)
+            if delta >= stillnessEps {
+                a.stillFrames = 0
+                a.stillX = p.x     // window restarts here
+                a.stillY = p.y
+                a.parked = false   // any real movement un-parks — parked thumbs don't move
+            } else {
+                a.stillFrames += 1
+                if a.stillFrames >= parkSettleFrames {
+                    // Window boundary — stillness is judged over whole windows,
+                    // never frame counts alone.
+                    if streakMoved >= streakEvidenceMM {
+                        // Dirty window — the evidence latched above. Roll the
+                        // window anyway so a contact that has STOPPED gets a
+                        // fresh measurement in which it can prove stillness,
+                        // instead of latching `moving` on a frozen streak.
+                        a.stillFrames = 0
+                        a.stillX = p.x
+                        a.stillY = p.y
+                    } else {
+                        // A full clean window — the ONLY place the evidence latch
+                        // releases: stillness proven in mm, not frames.
+                        moving = false
+                        a.stillFrames = 0
+                        a.stillX = p.x
+                        a.stillY = p.y
+                        if canPark && inBand {
+                            // Parking is earned by that same proof — and a parked
+                            // contact that re-proves stillness slides its anchor
+                            // to the new seat, so "travel" stays drift-from-
+                            // settlement rather than accruing against a stale spot.
+                            a.parked = true
+                            a.x = p.x
+                            a.y = p.y
+                        }
+                    }
+                }
+            }
+            a.lastX = p.x
+            a.lastY = p.y
+            a.lastSeenFrame = frameIndex
+            let travel = hypotf((p.x - a.x) * widthMM, (p.y - a.y) * heightMM)
+            // Slow drift past the tap threshold un-parks too — a thumb that has
+            // crept 4 mm from where it parked is a finger again, however slowly.
+            // Its stillness credit goes with it: re-earning the latch needs a
+            // fresh clean window, and the evidence latch stays up until one lands.
+            if a.parked, travel > tapPathTravelCancelMM {
+                a.parked = false
+                a.stillFrames = 0
+                a.stillX = p.x
+                a.stillY = p.y
+            }
+            a.movingEvidence = moving
+            pathAnchors[i] = a
+            return (travel, a.parked, moving)
         }
-        pathAnchors.append(PathAnchor(id: id, x: p.x, y: p.y, lastSeenFrame: frameIndex))
-        return 0
+        // Fresh landing. A contact appearing mid-gesture is a straggler candidate —
+        // its evidence latch starts SET so it counts for quarantine from the exact
+        // frame it lands (e.g. the pending-confirm frame) until it proves still;
+        // at idle `canPark` makes this false.
+        pathAnchors.append(PathAnchor(id: id, x: p.x, y: p.y, lastX: p.x, lastY: p.y,
+                                      stillX: p.x, stillY: p.y, lastSeenFrame: frameIndex,
+                                      stillFrames: 0, parked: false, movingEvidence: !canPark))
+        return (0, false, !canPark)
     }
 
     /// A 4+-finger sighting quarantines re-arms from BOTH the tap and the swipe (the
@@ -372,7 +588,8 @@ final class GestureRecognizer: @unchecked Sendable {
         swipeQuarantineUntil = timestamp + reArmQuarantine
     }
 
-    private func beginTracking(cx: Float, cy: Float, maxPathTravelMM: Float, timestamp: Double) {
+    private func beginTracking(cx: Float, cy: Float, maxPathTravelMM: Float,
+                               scrollBornPaths: Int, timestamp: Double) {
         phase = .tracking
         anchorX = cx
         anchorY = cy
@@ -383,8 +600,12 @@ final class GestureRecognizer: @unchecked Sendable {
         // flickering tail of a system gesture — barred from swiping for its whole life
         // (see `reArmQuarantine`). Birth-time, not entry-time: a four-finger swipe that
         // sheds a finger and continues on three would otherwise just outlive the window
-        // and fire the phantom ⌘Tab 0.3 s late.
-        bornInSystemGestureTail = timestamp < swipeQuarantineUntil
+        // and fire the phantom ⌘Tab 0.3 s late. Also barred when ANY path arrives
+        // already well-travelled: 30 mm of pre-birth motion is a contact that was
+        // moving long before this gesture armed — a two-finger scroll a third finger
+        // just dropped onto (or whose other scroll finger just lifted) — which would
+        // carry its scroll momentum straight over the step threshold.
+        bornInSystemGestureTail = timestamp < swipeQuarantineUntil || scrollBornPaths >= 1
         // The tap is additionally barred by every abnormal-end quarantine, and by
         // touches that have already travelled (a pinch mid-flight whose thumb just slid
         // into the palm filter's edge band). Travel does NOT bar the swipe: a
@@ -392,16 +613,20 @@ final class GestureRecognizer: @unchecked Sendable {
         // inside the edge band and sweeps out of it.
         bornTapQuarantined = timestamp < quarantineUntil
         movedTooFar = bornTapQuarantined || maxPathTravelMM > tapPathTravelCancelMM
+        suppressionLatched = true
         onGestureActiveChanged?(true)
     }
 
-    private func handleTracking(valid: Int, cx: Float, cy: Float, maxPathTravelMM: Float,
+    private func handleTracking(quarantineCount: Int, valid: Int, cx: Float, cy: Float, maxPathTravelMM: Float,
                                 timestamp: Double, config: Config, widthMM: Float, heightMM: Float) {
-        if valid >= 4 {
+        if quarantineCount >= 4 {
             // 4+ fingers belong to the system (Mission Control, Launchpad, show
             // desktop, Spaces). Quarantine the re-arm: those gestures' tails flicker
             // through exactly three contacts, which must not open a fresh tap OR
-            // swipe window.
+            // swipe window. Quarantine-counted, not merely physical: a palm-filtered
+            // fourth contact only counts once it moves, so a resting thumb mid-pad
+            // doesn't kill an in-flight gesture — but a moving filtered fourth finger
+            // still exposes a system gesture within a frame or two.
             quarantineFourFingerSighting(at: timestamp)
             reset()
             return
@@ -413,10 +638,17 @@ final class GestureRecognizer: @unchecked Sendable {
             if valid == 0 {
                 // Clean lift during the hold: a quick flick. No 4th finger can be
                 // arriving through a falling count — confirm and commit right now, so
-                // the hold adds zero latency to the flick-and-lift switch.
-                onAction?(.swipeBegin)
-                onAction?(.swipeStep(.forward))
-                onAction?(.swipeCommit)
+                // the hold adds zero latency to the flick-and-lift switch. Re-validate
+                // the toggle at commit like the timed path below. (No quarantine
+                // re-check needed here or in the debounce path: pending can only
+                // exist when !bornInSystemGestureTail, and any sighting that would
+                // advance swipeQuarantineUntil resets the gesture — clearing
+                // pending — before this code runs.)
+                if config.appSwitchEnabled {
+                    onAction?(.swipeBegin)
+                    onAction?(.swipeStep(.forward))
+                    onAction?(.swipeCommit)
+                }
                 reset()
                 return
             }
@@ -426,16 +658,26 @@ final class GestureRecognizer: @unchecked Sendable {
                 // a dropout could still be a landing straggler mid-flicker.
                 lowFrameCount += 1
                 if lowFrameCount >= endDebounceFrames {
-                    onAction?(.swipeBegin)
-                    onAction?(.swipeStep(.forward))
-                    onAction?(.swipeCommit)
+                    if config.appSwitchEnabled {
+                        onAction?(.swipeBegin)
+                        onAction?(.swipeStep(.forward))
+                        onAction?(.swipeCommit)
+                    }
                     reset()
                 }
                 return
             }
             lowFrameCount = 0
             if timestamp - pending >= entryConfirmDelay {
-                enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
+                // Re-validate at commit time, not just at arm: the user can toggle
+                // app-switching off mid-hold, and the quarantine can also have
+                // armed (a 4+ sighting during the delay) since the entry fired.
+                if config.appSwitchEnabled, !bornInSystemGestureTail,
+                   timestamp >= swipeQuarantineUntil {
+                    enterSwiping(cx: cx, cy: cy, timestamp: timestamp)
+                } else {
+                    swipePendingSince = nil   // silently abandon — nothing posted yet
+                }
             }
             return
         }
@@ -492,6 +734,22 @@ final class GestureRecognizer: @unchecked Sendable {
         if valid < 3, timestamp - startTime > tapMaxDuration {
             quarantineUntil = timestamp + reArmQuarantine
             reset()
+            return
+        }
+        // valid == 3 at this point. macOS only synthesizes a native click from a
+        // TAP-like contact — brief and near-stationary — so once this gesture has
+        // outlived the tap window there is no synthesized click left to suppress:
+        // release the latch instead of eating the user's real clicks (on a mouse
+        // too — the tap is system-wide) for as long as three fingers happen to
+        // rest on the surface. Tracking continues — a swipe can still start —
+        // and enterSwiping re-latches. Unreachable while a swipe is pending (the
+        // pending branch above returns first); a pending that began AFTER a release
+        // simply stays unlatched until enterSwiping fires — fine, since a post-window
+        // gesture can't synthesize a click anyway. Tails armed by this `false` cover
+        // the exact release moment.
+        if suppressionLatched, swipePendingSince == nil, timestamp - startTime > tapMaxDuration {
+            suppressionLatched = false
+            onGestureActiveChanged?(false)
         }
     }
 
@@ -499,6 +757,13 @@ final class GestureRecognizer: @unchecked Sendable {
         phase = .swiping
         swipePendingSince = nil
         swipeStartTime = timestamp
+        // Re-latch click suppression if the gesture outlived the tap window before
+        // swiping (handleTracking released it): real user clicks are eaten for the
+        // duration of a switch, same as a scrub that started inside the window.
+        if !suppressionLatched {
+            suppressionLatched = true
+            onGestureActiveChanged?(true)
+        }
         onAction?(.swipeBegin)
         // The first step always opens forward (⌘Tab), regardless of swipe direction.
         // Tapping ⌘Tab opens the switcher already moved one app forward (to the previous
@@ -510,9 +775,9 @@ final class GestureRecognizer: @unchecked Sendable {
         anchorY = cy
     }
 
-    private func handleSwiping(valid: Int, cx: Float, cy: Float, timestamp: Double,
+    private func handleSwiping(quarantineCount: Int, valid: Int, cx: Float, cy: Float, timestamp: Double,
                                distanceMM: Float, widthMM: Float, heightMM: Float) {
-        if valid >= 4 {
+        if quarantineCount >= 4 {
             onAction?(.cancel)
             quarantineFourFingerSighting(at: timestamp)
             reset()
@@ -551,25 +816,37 @@ final class GestureRecognizer: @unchecked Sendable {
         let dxMM = (cx - anchorX) * widthMM
         let dyMM = (cy - anchorY) * heightMM
         let adx = abs(dxMM), ady = abs(dyMM)
-        if adx >= distanceMM, adx > stepDominance * ady {
-            // Suppress steps until the HUD is up: travel before then only ever yields
-            // the single switch already emitted on `.swipeBegin`. Re-anchor either way
-            // so the swallowed travel is consumed — no catch-up burst the instant the
-            // HUD appears.
-            if timestamp - swipeStartTime >= hudRevealDelay {
-                onAction?(.swipeStep(dxMM > 0 ? .forward : .backward))
+        if adx >= distanceMM {
+            if adx > stepDominance * ady {
+                // Suppress steps until the HUD is up: travel before then only ever yields
+                // the single switch already emitted on `.swipeBegin`. Re-anchor either way
+                // so the swallowed travel is consumed — no catch-up burst the instant the
+                // HUD appears.
+                if timestamp - swipeStartTime >= hudRevealDelay {
+                    onAction?(.swipeStep(dxMM > 0 ? .forward : .backward))
+                }
+                anchorX = cx          // reset anchor so a long sweep steps repeatedly
+                anchorY = cy
+            } else {
+                // Enough horizontal travel but the diagonal component broke dominance —
+                // a curved swipe drifting vertically. Absorb the vertical excursion
+                // (horizontal progress keeps accumulating toward the step): otherwise
+                // the stale Y anchor lets the curve block stepping until the hand
+                // travels far enough horizontally to out-grow it.
+                anchorY = cy
             }
-            anchorX = cx          // reset anchor so a long sweep steps repeatedly
-            anchorY = cy
         }
     }
 
     /// Clear all state back to idle without emitting any action. The engine calls this
     /// before `start()` so a restart never resumes a stale phase left by a run that
-    /// stopped mid-gesture; it is safe because frame delivery is not yet enabled when
-    /// the engine calls it. Also drops both quarantines: a fresh stream's timestamp
-    /// domain may differ, so a stale deadline could quarantine forever (or not at all).
+    /// stopped mid-gesture. Serialized behind `processLock` — a frame already in
+    /// flight on a device thread can't tear the state mid-reset. Also drops both
+    /// quarantines: a fresh stream's timestamp domain may differ, so a stale deadline
+    /// could quarantine forever (or not at all).
     func resetState() {
+        processLock.lock()
+        defer { processLock.unlock() }
         clearGesture()
         quarantineUntil = 0
         swipeQuarantineUntil = 0
@@ -581,8 +858,15 @@ final class GestureRecognizer: @unchecked Sendable {
     /// quarantine deliberately survives — the sites that set it do so right before
     /// calling this.
     private func reset() {
+        // Emit the "gesture over" edge only when the click-suppression latch is still
+        // ours to release. A gesture that already outlived its tap window released the
+        // latch mid-rest (see handleTracking); a second `false` here would re-arm the
+        // post-gesture suppression tails and swallow the user's real click that lands
+        // right after those fingers lift — a lift that old can't synthesize a click,
+        // so the tail has nothing to suppress.
+        let wasLatched = suppressionLatched
         clearGesture()
-        onGestureActiveChanged?(false)
+        if wasLatched { onGestureActiveChanged?(false) }
     }
 
     /// Per-gesture state only. `pathAnchors` deliberately survives: while touches
@@ -603,24 +887,19 @@ final class GestureRecognizer: @unchecked Sendable {
         swipeStartTime = 0
         lastTimestamp = 0
         lowFrameCount = 0
+        suppressionLatched = false
     }
 
-    /// A contact is a palm if it's too large, or — only while a gesture is just
-    /// starting (`applyEdgeBand`) — if it sits in the edge/bottom exclusion band.
-    /// The edge band is dropped once a gesture is underway so a finger sweeping
-    /// toward an edge during a horizontal swipe stays counted (otherwise the
-    /// centroid jumps and accumulated travel resets). A real palm dropping in
-    /// mid-gesture is still caught by the size cap.
-    private func isPalm(position p: MTPoint, size: Float, edgeBandMM: Float,
-                        maxSize: Float, widthMM: Float, heightMM: Float,
-                        applyEdgeBand: Bool) -> Bool {
-        if size > maxSize { return true }
-        if applyEdgeBand {
-            let xMM = p.x * widthMM
-            let yMM = p.y * heightMM
-            if xMM < edgeBandMM || xMM > widthMM - edgeBandMM { return true }
-            if yMM < edgeBandMM { return true }
-        }
-        return false
+    /// Whether a position sits inside the edge/bottom exclusion band (measured in mm
+    /// in from the left, right, and bottom rim — the top edge is deliberately exempt
+    /// since real swipes start there). The band filters rim contacts while a gesture
+    /// is only just starting, and feeds the `parked` latch in `notePathTravel` — a
+    /// contact that lands or settles inside it and never moves stays filtered for
+    /// its whole still life: the resting-thumb case.
+    private func inEdgeBand(_ p: MTPoint, edgeBandMM: Float,
+                            widthMM: Float, heightMM: Float) -> Bool {
+        let xMM = p.x * widthMM
+        let yMM = p.y * heightMM
+        return xMM < edgeBandMM || xMM > widthMM - edgeBandMM || yMM < edgeBandMM
     }
 }

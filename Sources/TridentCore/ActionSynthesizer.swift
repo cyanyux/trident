@@ -35,6 +35,29 @@ final class ActionSynthesizer: @unchecked Sendable {
     /// Whether ⌘ is currently held. Touched only on `eventQueue`.
     private var commandHeld = false
 
+    /// Whether ⌘ was pressed during the current run — stays set until `prepare()`,
+    /// even after a release posts, because a posted release is not a delivered one.
+    /// Lets `notePermissionLost()` tell "⌘ may be stuck" apart from "nothing was
+    /// ever pressed". Touched only on `eventQueue`.
+    private var commandPressedThisRun = false
+
+    /// Set by `notePermissionLost()` when a run that pressed ⌘ ends under a TCC
+    /// revoke: releases posted after the revoke are silently DROPPED by the system
+    /// even though `CGEvent.post` reported success, so `commandHeld` may have cleared
+    /// while the physical ⌘ is still down. Consumed by `prepare()`, which re-posts
+    /// the phase-appropriate finishers once permission is back. Unlike an
+    /// unconditional flush it fires only when this run actually pressed ⌘ — never
+    /// clobbering a ⌘ the user physically holds. Touched only on `eventQueue`.
+    private var commandMaybeStuck = false
+
+    /// Invoked on `eventQueue` when a held-⌘ lifecycle fully settles: a terminal
+    /// release posted, or a terminal action found nothing held. The engine uses it
+    /// to lift the cursor freeze AFTER the ⌘-up (or the cancel's Escape + settle)
+    /// has posted — unfreezing earlier let a still-open HUD read the live cursor
+    /// position and hijack the switch selection to whatever was under the pointer.
+    /// Set once at wiring time, before `start()`.
+    var onCommandReleased: (() -> Void)?
+
     /// Where a held ⌘ is in its lifecycle — tells the watchdog HOW to recover it if a release post
     /// fails to create. `.inProgress`: no terminal action yet, so recover ONLY on a dead frame
     /// stream (the gesture died) and cancel — never commit a stale highlight. `.committing`: a
@@ -128,6 +151,19 @@ final class ActionSynthesizer: @unchecked Sendable {
         eventQueue.sync { commandHeld }
     }
 
+    /// Record that Accessibility permission was (probably) just lost. Called by the app
+    /// layer when its live probe reports a revoke, BEFORE the engine stops: releases
+    /// posted after a revoke are silently dropped even though `CGEvent.post` reported
+    /// success — so a ⌘ this run pressed may still be physically down with `commandHeld`
+    /// already cleared. Latched and resolved by the next `prepare()`. Async on
+    /// `eventQueue`: ordered ahead of that queue's next recovery pass.
+    func notePermissionLost() {
+        eventQueue.async { [weak self] in
+            guard let self, self.commandPressedThisRun else { return }
+            self.commandMaybeStuck = true
+        }
+    }
+
     /// Reopen the gate closed by `releaseAllAndWait()`. The engine calls this on start,
     /// before frame delivery is enabled; queued ahead of any possible action on the
     /// same serial queue, so the new run's first action can't be dropped.
@@ -135,24 +171,37 @@ final class ActionSynthesizer: @unchecked Sendable {
         eventQueue.async { [weak self] in
             guard let self else { return }
             self.stopped = false
-            // Recover from a prior teardown whose release never posted: `commandHeld` still true, the
-            // watchdog already stopped, ⌘ possibly stuck with the HUD up. Dismiss-then-release (best
-            // effort — creation may have recovered) so a stuck ⌘ clears the moment we can, THEN force
-            // `commandHeld` false so the new run's first `.swipeBegin` can press ⌘ fresh.
-            // pressCommand's postKey no-ops while creation is still broken (so this can't
-            // double-press), and a ⌘-up clears the flag regardless of stacked downs. Runs on the
-            // serial queue ahead of any action, before frames are enabled.
-            if self.commandHeld {
+            // Recover from a prior teardown whose release never posted OR never DELIVERED:
+            // `commandHeld` still true covers a failed post; `commandMaybeStuck` covers a
+            // release that posted under a TCC revoke and was dropped in transit. Resolve
+            // by PHASE either way (a `.committing` ⌘ completes as a commit with no Escape;
+            // otherwise dismiss-then-release), then force-clear so the new run's first
+            // `.swipeBegin` presses fresh. Runs on the serial queue ahead of any action,
+            // before frames are enabled.
+            if self.commandHeld || self.commandMaybeStuck {
                 // For a dismiss recovery, a teardown Escape may have been DROPPED at delivery
                 // (posted ≠ delivered), so re-dismiss on restart rather than trust the latch
-                // (`hudDismissed = false`). Resolve by PHASE (a `.committing` ⌘ completes as a commit
-                // with no Escape; otherwise dismiss-then-release), then force `commandHeld` false so
-                // the next `.swipeBegin` presses fresh (postKey no-ops while creation is still broken,
-                // so this can't double-press).
+                // (`hudDismissed = false`).
                 self.hudDismissed = false
+                if !self.commandHeld {
+                    // Maybe-stuck: `commandHeld` cleared because the release POSTED, but
+                    // under the revoke it never delivered — treat ⌘ as still held so the
+                    // phase-aware resolver re-posts the finishers. Harmless insurance when
+                    // it actually did deliver (an extra ⌘-up or ⌘-Escape only ever fires
+                    // here, in recovery, and only when ⌘ was pressed at all). Residual
+                    // risk, accepted: a false-positive probe could send ⌘-up while the
+                    // user physically holds ⌘, or a ⌘-Escape to the front app — bounded,
+                    // once, and only after a run that pressed ⌘ itself. And if the engine
+                    // somehow restarts while STILL revoked (a stale probe), these posts
+                    // report success, drop silently, and consume `commandMaybeStuck` —
+                    // that path can't detect delivery either way.
+                    self.commandHeld = true
+                }
                 self.resolveHeldCommand()
                 self.commandHeld = false
             }
+            self.commandMaybeStuck = false
+            self.commandPressedThisRun = false
         }
     }
 
@@ -198,10 +247,20 @@ final class ActionSynthesizer: @unchecked Sendable {
             tapTab(backward: direction == .backward)
         case .swipeCommit:
             heldPhase = .committing   // a failed commit release must retry as a commit, not a cancel
-            releaseCommand()
+            if commandHeld {
+                releaseCommand()      // fires onCommandReleased once the ⌘-up posts
+            } else {
+                // Nothing held — no release left to wait on, so settle now or the
+                // cursor freeze would never lift.
+                onCommandReleased?()
+            }
         case .cancel:
             heldPhase = .cancelling
-            dismissAndRelease()
+            if commandHeld {
+                dismissAndRelease()   // settles via releaseCommand after the Escape
+            } else {
+                onCommandReleased?()
+            }
         }
     }
 
@@ -227,6 +286,7 @@ final class ActionSynthesizer: @unchecked Sendable {
         // leaking a bare Tab to the front app under a phantom-held ⌘.
         guard postKey(Key.command, flags: .maskCommand, down: true) else { return }
         commandHeld = true
+        commandPressedThisRun = true   // lets a later notePermissionLost mark ⌘ maybe-stuck
         heldPhase = .inProgress    // until a terminal action; a stream death before then cancels
         hudDismissed = false       // fresh gesture: no dismiss Escape has posted yet
         startWatchdog()
@@ -262,6 +322,9 @@ final class ActionSynthesizer: @unchecked Sendable {
         if posted {
             commandHeld = false
             stopWatchdog()
+            // Settled — the engine lifts the cursor freeze here, AFTER the ⌘-up posts,
+            // so a still-drawing HUD can't read the cursor and hijack the selection.
+            onCommandReleased?()
         }
         log.notice("release ⌘ (posted=\(posted))")
     }

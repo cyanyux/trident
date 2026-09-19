@@ -30,7 +30,7 @@ final class GestureRecognizerTests: XCTestCase {
     /// same physical finger across time must reuse the same path, like the hardware.
     private func contact(_ x: Float, _ y: Float, path: Int32 = 0) -> MTTouch {
         MTTouch(
-            frame: 0, timestamp: 0, pathIndex: path, state: TouchState.active,
+            frame: 0, timestamp: 0, pathIndex: path, state: TouchState.touching,
             fingerID: 0, handID: 0,
             normalizedVector: MTVector(position: MTPoint(x: x, y: y), velocity: MTPoint(x: 0, y: 0)),
             zTotal: 1.0, field9: 0, angle: 0, majorAxis: 0, minorAxis: 0,
@@ -554,6 +554,446 @@ final class GestureRecognizerTests: XCTestCase {
         feed(frame, at: 0.00)                      // palm dropped → only 2 valid
         feed(frame, at: 0.05)
         feed([], at: 0.08)
+        XCTAssertEqual(actions, [])
+    }
+
+    // MARK: - Four-finger quarantine (moving filtered contacts count)
+
+    /// A palm-filtered fourth finger (oversized, mid-pad) doesn't stop a gesture
+    /// from arming while it sits still — but the moment it MOVES it counts as
+    /// fourth-finger evidence and the armed gesture is cancelled + quarantined.
+    func testOversizedFourthFingerStillQuarantinesSwipe() {
+        var big = contact(0.80, 0.5, path: 3)
+        big.zTotal = 3.0                          // over the size cap → palm-filtered
+        var bigMoved = contact(0.86, 0.5, path: 3)  // same path id, 6 mm of travel
+        bigMoved.zTotal = 3.0
+        feed(threeFingers(centerX: 0.40) + [big], at: 0.00)      // filtered, still → arms
+        feed(threeFingers(centerX: 0.40) + [bigMoved], at: 0.02) // filtered + MOVING → quarantine
+        feed(threeFingers(centerX: 0.40), at: 0.04)              // oversized lifts — tail barred
+        feed(threeFingers(centerX: 0.56), at: 0.06)
+        feed([], at: 0.10)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A fourth finger landing inside the edge band is filtered to `valid == 3`,
+    /// so a clean gesture arms — but the moment it MOVES it counts as fourth-finger
+    /// evidence and the armed gesture is cancelled + quarantined. The old
+    /// valid-count check never saw it at all and its tail swiped.
+    func testEdgeFilteredFourthFingerStillQuarantines() {
+        recognizer.setPalmRejection(edgeBandMM: 11, maxSize: 1.5)
+        feed(threeFingers(centerX: 0.40) + [contact(0.04, 0.5, path: 3)], at: 0.00) // in band, still → arms
+        feed(threeFingers(centerX: 0.40) + [contact(0.09, 0.5, path: 3)], at: 0.02) // 4th contact moving → cancel + quarantine
+        feed(threeFingers(centerX: 0.40), at: 0.04)   // edge finger lifts — tail quarantined
+        feed(threeFingers(centerX: 0.56), at: 0.06)   // over threshold — must not swipe
+        feed([], at: 0.10)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Mid-gesture the edge band no longer applies, and ANY fourth contact landing
+    /// while tracking is a straggler candidate — it counts on the frame it lands
+    /// (even an oversized one that never moves), so the armed gesture cancels and
+    /// quarantines immediately rather than waiting for it to move.
+    func testOversizedFourthFingerDuringTrackingResets() {
+        var big = contact(0.80, 0.5, path: 3)
+        big.zTotal = 3.0
+        feed(threeFingers(centerX: 0.40), at: 0.00)              // tracking, 3 contacts
+        feed(threeFingers(centerX: 0.40) + [big], at: 0.02)      // filtered landing mid-gesture → reset
+        feed(threeFingers(centerX: 0.40), at: 0.06)              // tail — quarantined
+        feed(threeFingers(centerX: 0.56), at: 0.08)              // must not swipe
+        feed([], at: 0.12)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The flip side of the movement gate: a palm-filtered contact that NEVER moves
+    /// is a resting thumb, not a system gesture — three fingers resting next to it
+    /// must still tap and swipe normally. Bars the regression where parking a thumb
+    /// at the pad's rim disabled every gesture. The faithful posture: the thumb is
+    /// down and settled BEFORE the fingers land — parking is earned by stillness,
+    /// so a thumb landing simultaneously with the fingers stays unproven (that's a
+    /// four-contact landing, which quarantines like any system gesture).
+    func testRestingFilteredThumbDoesNotQuarantineGestures() {
+        let thumb = contact(0.03, 0.5, path: 3)    // inside the default edge band
+        for i in 0..<10 {                          // thumb down first, settles → parked
+            feed([thumb], at: Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.40) + [thumb], at: 0.30)
+        feed(threeFingers(centerX: 0.40) + [thumb], at: 0.34)
+        feed([], at: 0.38)
+        XCTAssertEqual(actions, [.middleClick])
+        actions.removeAll()
+        // Same again for a swipe — the parked latch died with the full lift, so
+        // the thumb settles again before the fingers come down.
+        for i in 0..<10 {
+            feed([thumb], at: 0.50 + Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.30) + [thumb], at: 0.80)
+        feed(threeFingers(centerX: 0.50) + [thumb], at: 0.82)   // crosses → held
+        feed(threeFingers(centerX: 0.50) + [thumb], at: 0.88)   // confirm → begin + step
+        feed(threeFingers(centerX: 0.70) + [thumb], at: 1.15)   // step past HUD delay
+        feed([], at: 1.20)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// A fourth finger that lands WHILE a three-finger gesture sits in its
+    /// swipe-entry hold is a system-gesture straggler — during .tracking the edge
+    /// band no longer applies, so a normal-size band landing isn't filtered at
+    /// all and counts as a plain fourth contact (the filtered variant that counts
+    /// via the `moving` evidence is testFilteredStragglerLandingOnConfirmFrameStillCounts).
+    /// Either way it must kill the pending swipe before it can post a phantom
+    /// ⌘Tab into the OS's own four-finger gesture.
+    func testBandStragglerDuringSwipeHoldQuarantines() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)                 // arm
+        feed(threeFingers(centerX: 0.46), at: 0.02)                 // crosses → entry held
+        // straggler lands IN the band mid-hold — phase is .tracking, so it can never park
+        feed(threeFingers(centerX: 0.46) + [contact(0.03, 0.5, path: 3)], at: 0.04)
+        feed(threeFingers(centerX: 0.46) + [contact(0.03, 0.5, path: 3)], at: 0.10) // past the confirm — must NOT fire
+        feed([], at: 0.14)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The posture people actually hold: the thumb slides onto the pad's rim and
+    /// settles — it never "lands" inside the band, so landing-time parking never
+    /// sees it. After a beat of stillness it must retro-park and stop counting, or
+    /// a parked thumb that slid home keeps quarantining every gesture.
+    func testThumbSlidIntoBandParksAfterSettling() {
+        feed([contact(0.30, 0.5, path: 3)], at: 0.00)   // lands midpad — no park
+        feed([contact(0.20, 0.5, path: 3)], at: 0.02)   // sliding toward the rim
+        feed([contact(0.10, 0.5, path: 3)], at: 0.04)
+        feed([contact(0.05, 0.5, path: 3)], at: 0.06)   // arrives inside the 7 mm band
+        for i in 0..<10 {                               // settles — ≥ parkSettleFrames
+            feed([contact(0.05, 0.5, path: 3)], at: 0.08 + Double(i) * 0.02)
+        }
+        // three fingers beside the now-parked thumb swipe normally. (A swipe is
+        // shown here; a tap would work too — earning the latch re-bases the
+        // travel anchor to the parked spot, so the slide-in's 25 mm no longer
+        // counts against the tap's travel budget.)
+        feed(threeFingers(centerX: 0.35) + [contact(0.05, 0.5, path: 3)], at: 0.30)
+        feed(threeFingers(centerX: 0.51) + [contact(0.05, 0.5, path: 3)], at: 0.32)  // crosses → held
+        feed(threeFingers(centerX: 0.51) + [contact(0.05, 0.5, path: 3)], at: 0.38)  // confirm → begin + step
+        feed(threeFingers(centerX: 0.65) + [contact(0.05, 0.5, path: 3)], at: 0.70)  // step past the HUD delay
+        feed([], at: 0.75)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// A parked thumb that lifts for more than one frame and re-lands — even back
+    /// inside the band — has lost its latch: a >1-frame gap is a re-plant, not a
+    /// flicker, and the contact must re-prove itself. It counts as a fourth finger.
+    func testParkedThumbReLandingAfterGapCounts() {
+        let thumb = contact(0.05, 0.5, path: 3)
+        for i in 0..<10 { feed([thumb], at: Double(i) * 0.02) }   // settles → parked
+        feed(threeFingers(centerX: 0.45) + [thumb], at: 0.30)     // arm
+        feed(threeFingers(centerX: 0.45), at: 0.32)               // thumb lifts — stream stays live
+        feed(threeFingers(centerX: 0.45), at: 0.34)
+        feed(threeFingers(centerX: 0.45), at: 0.36)               // absent 3 frames → re-landing
+        feed(threeFingers(centerX: 0.45) + [thumb], at: 0.38)     // same spot — latch dropped → counts
+        feed([], at: 0.44)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A parked thumb re-landing MIDPAD on the same path id is a fresh finger
+    /// wearing a stale identity — it counts as a fourth contact immediately.
+    func testParkedThumbReLandingMidpadCounts() {
+        let thumb = contact(0.05, 0.5, path: 3)
+        for i in 0..<10 { feed([thumb], at: Double(i) * 0.02) }   // settles → parked
+        feed(threeFingers(centerX: 0.45) + [thumb], at: 0.30)     // arm
+        feed(threeFingers(centerX: 0.45), at: 0.32)               // thumb lifts — stream stays live
+        feed(threeFingers(centerX: 0.45), at: 0.34)               // absent 2 frames → gap = 3
+        // re-lands MIDPAD on the same path id — delta un-parks it regardless of gap
+        feed(threeFingers(centerX: 0.45) + [contact(0.52, 0.5, path: 3)], at: 0.36)
+        feed(threeFingers(centerX: 0.45) + [contact(0.52, 0.5, path: 3)], at: 0.38)
+        feed([], at: 0.44)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The flip side of the re-landing rule: a parked thumb that drops out for ONE
+    /// frame mid-gesture and comes back at the same spot is a sensor flicker, not
+    /// a re-plant. Its latch must survive — otherwise a routine rim-contact
+    /// dropout reads as a phantom fourth finger, cancels a live swipe, and
+    /// quarantines the follow-up gesture.
+    func testParkedThumbOneFrameDropoutKeepsLatch() {
+        let thumb = contact(0.05, 0.5, path: 3)
+        for i in 0..<10 { feed([thumb], at: Double(i) * 0.02) }   // settles → parked
+        feed(threeFingers(centerX: 0.40) + [thumb], at: 0.30)     // arm
+        feed(threeFingers(centerX: 0.56) + [thumb], at: 0.32)     // crosses → held
+        feed(threeFingers(centerX: 0.56), at: 0.34)               // thumb drops ONE frame
+        feed(threeFingers(centerX: 0.56) + [thumb], at: 0.36)     // back at the same spot
+        feed(threeFingers(centerX: 0.56) + [thumb], at: 0.40)     // confirm → begin + step
+        feed(threeFingers(centerX: 0.72) + [thumb], at: 0.70)     // step past the HUD delay
+        feed([], at: 0.75)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// A parked thumb that scoots >4 mm along the rim un-parks (drift) — but once
+    /// it settles again its stale travel must stop counting, or the pad stays
+    /// quarantined every frame until it re-parks. After re-settling in-band it
+    /// re-parks (the anchor re-bases), and gestures beside it work normally.
+    func testReParkedThumbAfterRimScootStopsCounting() {
+        for i in 0..<10 {                                        // settles → parks in-band
+            feed([contact(0.02, 0.5, path: 3)], at: Double(i) * 0.02)
+        }
+        feed([contact(0.065, 0.5, path: 3)], at: 0.22)  // scoots within the band (>4 mm → un-parks)
+        for i in 0..<10 {                              // re-settles → retro-parks again
+            feed([contact(0.065, 0.5, path: 3)], at: 0.24 + Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.45) + [contact(0.065, 0.5, path: 3)], at: 0.50)
+        feed(threeFingers(centerX: 0.45) + [contact(0.065, 0.5, path: 3)], at: 0.54)
+        feed([], at: 0.58)
+        XCTAssertEqual(actions, [.middleClick])
+    }
+
+    /// The decay that makes the scoot test work: an oversized contact that drifts
+    /// and then settles must stop counting once it has ACTUALLY stopped — streak
+    /// displacement, not raw travel, is the evidence. Otherwise its stale >4 mm
+    /// travel quarantines the pad every frame until it lifts.
+    func testOversizedSettledAfterDriftStopsCounting() {
+        var big = contact(0.80, 0.5, path: 3)
+        big.zTotal = 3.0
+        feed([big], at: 0.00)
+        var bigDrifted = contact(0.86, 0.5, path: 3)   // drifts 6 mm
+        bigDrifted.zTotal = 3.0
+        feed([bigDrifted], at: 0.02)
+        for i in 0..<10 {                              // then sits — streak displacement ≈ 0
+            feed([bigDrifted], at: 0.04 + Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.40) + [bigDrifted], at: 0.30)
+        feed(threeFingers(centerX: 0.56) + [bigDrifted], at: 0.32)   // crosses → held
+        feed(threeFingers(centerX: 0.56) + [bigDrifted], at: 0.38)   // confirm → begin + step
+        feed([], at: 0.44)
+        // (A swipe, not a tap: the drifted contact's 6 mm travel bars the tap —
+        // movedTooFar — but path travel doesn't bar swipes.)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// A filtered contact creeping at sub-eps speed (≤0.5 mm/frame) must still
+    /// count for quarantine — it racks up stillFrames while physically moving, so
+    /// only displacement over the streak can expose it. Otherwise a system
+    /// gesture's slow finger hides while the pending swipe posts a phantom ⌘Tab.
+    func testSlowCreepFilteredContactStillCounts() {
+        var big = contact(0.80, 0.5, path: 3)
+        big.zTotal = 3.0
+        feed(threeFingers(centerX: 0.40) + [big], at: 0.00)      // arm — filtered, still
+        for i in 1...8 {                                        // creeps 0.4 mm/frame
+            var creep = contact(0.80 + Float(i) * 0.004, 0.5, path: 3)
+            creep.zTotal = 3.0
+            feed(threeFingers(centerX: 0.40) + [creep], at: Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.56), at: 0.30)             // the fingers try to swipe — long dead
+        feed(threeFingers(centerX: 0.56), at: 0.36)
+        feed([], at: 0.40)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A filtered straggler landing exactly on the pending-confirm frame is a
+    /// system-gesture candidate: it counts from creation (`moving = !canPark`),
+    /// so the qc≥4 check above the confirm disposes of it before anything posts.
+    func testFilteredStragglerLandingOnConfirmFrameStillCounts() {
+        var big = contact(0.80, 0.5, path: 3)
+        big.zTotal = 3.0
+        feed(threeFingers(centerX: 0.30), at: 0.00)              // arm
+        feed(threeFingers(centerX: 0.46), at: 0.02)              // crosses → entry held
+        feed(threeFingers(centerX: 0.46) + [big], at: 0.06)      // lands ON the confirm frame
+        feed(threeFingers(centerX: 0.46) + [big], at: 0.10)
+        feed([], at: 0.14)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// `scrollBornPaths >= 1`: a single path already carrying scroll momentum is
+    /// enough to bar the gesture. A two-finger scroll that sheds one finger and has
+    /// two fresh ones land beside it reads as three contacts — but one of them was
+    /// moving long before the gesture armed.
+    func testSinglePreTravelledPathBarsGesture() {
+        feed([contact(0.40, 0.5, path: 3)], at: 0.00)   // a scroll finger
+        feed([contact(0.75, 0.5, path: 3)], at: 0.02)   // 35 mm of travel — still in frame
+        // two fresh fingers join it: three contacts, one scroll-born
+        feed([contact(0.42, 0.5, path: 0), contact(0.48, 0.5, path: 1), contact(0.75, 0.5, path: 3)], at: 0.04)
+        feed([contact(0.62, 0.5, path: 0), contact(0.68, 0.5, path: 1), contact(0.75, 0.5, path: 3)], at: 0.06)
+        feed([contact(0.62, 0.5, path: 0), contact(0.68, 0.5, path: 1), contact(0.75, 0.5, path: 3)], at: 0.12)
+        feed([], at: 0.16)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// A two-finger scroll whose contacts carry >30 mm of momentum and then pick up
+    /// a third finger must not arm a swipe — the scroll travel would carry straight
+    /// over the step threshold and post a phantom ⌘Tab.
+    func testTwoFingerScrollThenThirdFingerDoesNotSwipe() {
+        feed([contact(0.30, 0.5, path: 0), contact(0.40, 0.5, path: 1)], at: 0.00)
+        feed([contact(0.45, 0.5, path: 0), contact(0.55, 0.5, path: 1)], at: 0.02)   // 15 mm
+        feed([contact(0.62, 0.5, path: 0), contact(0.72, 0.5, path: 1)], at: 0.04)   // 32 mm — scroll momentum
+        // a third finger lands beside the still-moving pair — reads as 3 contacts
+        feed([contact(0.62, 0.5, path: 0), contact(0.72, 0.5, path: 1), contact(0.80, 0.5, path: 2)], at: 0.06)
+        feed([contact(0.80, 0.5, path: 0), contact(0.88, 0.5, path: 1), contact(0.92, 0.5, path: 2)], at: 0.08)
+        feed([contact(0.80, 0.5, path: 0), contact(0.88, 0.5, path: 1), contact(0.92, 0.5, path: 2)], at: 0.14)
+        feed([], at: 0.20)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The swipe-entry hold re-validates at commit: toggling app-switching off while
+    /// a swipe sits in the confirmation window must abandon it silently — nothing
+    /// was posted yet, so nothing should be.
+    func testPendingSwipeAbandonsWhenAppSwitchDisabledMidHold() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)     // arm
+        feed(threeFingers(centerX: 0.46), at: 0.02)     // crosses → entry held
+        recognizer.setAppSwitchEnabled(false)           // user toggles mid-hold
+        feed(threeFingers(centerX: 0.46), at: 0.10)     // past the confirm — abandons
+        feed([], at: 0.14)
+        XCTAssertEqual(actions, [])
+        recognizer.setAppSwitchEnabled(true)
+    }
+
+    // MARK: - Suppression latch release (resting fingers must not eat clicks)
+
+    /// Three fingers left resting on the surface past the tap window can no longer
+    /// synthesize a native click — the latch must release so real clicks (on a mouse
+    /// too: the tap is system-wide) aren't eaten for as long as the fingers rest.
+    func testRestingThreeFingersReleaseGestureLatch() {
+        var changes: [Bool] = []
+        recognizer.onGestureActiveChanged = { changes.append($0) }
+        feed(threeFingers(centerX: 0.5), at: 0.00)               // latch on
+        feed(threeFingers(centerX: 0.5), at: 0.05)
+        feed(threeFingers(centerX: 0.5), at: 0.20)               // tap window passed → off
+        feed(threeFingers(centerX: 0.5), at: 1.00)               // still resting — stays off
+        XCTAssertEqual(changes, [true, false])
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The released latch doesn't end the gesture: a swipe starting after the dwell
+    /// re-latches for the switch's lifetime, then releases at commit.
+    func testSwipeAfterDwellReleaseRelatches() {
+        var changes: [Bool] = []
+        recognizer.onGestureActiveChanged = { changes.append($0) }
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.30), at: 0.20)              // dwell → latch released
+        feed(threeFingers(centerX: 0.46), at: 0.30)              // crosses → entry held
+        feed(threeFingers(centerX: 0.46), at: 0.40)              // confirm → re-latch + begin
+        feed([], at: 0.45)
+        XCTAssertEqual(changes, [true, false, true, false])
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeCommit])
+    }
+
+    // MARK: - Force-Touch state (a hard press is still a contact)
+
+    /// A finger pressing hard mid-swipe reports state 5 (Force Touch / break-touch).
+    /// Counted as a contact, the gesture count stays at three — otherwise three
+    /// consecutive state-5 frames read as a finger lift and prematurely commit.
+    func testForceTouchStateDoesNotDropSwipeCount() {
+        var hard = contact(0.46, 0.5, path: 1)
+        hard.state = TouchState.breakTouch
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)              // crosses → held
+        feed(threeFingers(centerX: 0.46), at: 0.07)              // confirm → begin + step
+        // three consecutive break-touch frames — the old state set dropped them,
+        // so the count read as two and the debounce committed early
+        feed([contact(0.42, 0.5, path: 0), hard, contact(0.50, 0.5, path: 2)], at: 0.09)
+        feed([contact(0.42, 0.5, path: 0), hard, contact(0.50, 0.5, path: 2)], at: 0.11)
+        feed([contact(0.42, 0.5, path: 0), hard, contact(0.50, 0.5, path: 2)], at: 0.13)
+        // state back to normal and the scrub continues — a step still fires
+        feed(threeFingers(centerX: 0.62), at: 0.35)
+        feed([], at: 0.40)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    // MARK: - Curved swipes (vertical excursion is absorbed, not fatal)
+
+    /// A scrub that arcs downward keeps stepping: the vertical excursion is
+    /// absorbed into the anchor so horizontal progress still counts. With a stale
+    /// Y anchor the last frame here reads dx=30 vs dy=30 — dominance fails and the
+    /// step never fires.
+    func testCurvedSwipeAbsorbsVerticalExcursion() {
+        feed(threeFingers(centerX: 0.30), at: 0.00)
+        feed(threeFingers(centerX: 0.46), at: 0.02)                    // crosses → held
+        feed(threeFingers(centerX: 0.46), at: 0.07)                    // confirm → begin + step
+        // the curve: 14 mm right but 18 mm down — dominance fails → absorb Y, keep X
+        feed(threeFingers(centerX: 0.60, centerY: 0.68), at: 0.40)
+        // still arcing: 16 mm right of the absorbed anchor, 12 mm down → steps
+        feed(threeFingers(centerX: 0.76, centerY: 0.80), at: 0.45)
+        feed([], at: 0.50)
+        XCTAssertEqual(actions, [.swipeBegin, .swipeStep(.forward), .swipeStep(.forward), .swipeCommit])
+    }
+
+    /// The streak window must ROLL, not latch: a filtered contact that creeps past
+    /// the streak bound and then stops has to stop counting — the window re-bases
+    /// so a stopped creeper heals instead of quarantining the pad forever while it
+    /// stays down (which is exactly how a resting thumb sits).
+    func testStoppedCreepHealsStreakEvidence() {
+        var big = contact(0.80, 0.5, path: 3)
+        big.zTotal = 3.0
+        feed([big], at: 0.00)
+        for i in 1...6 {                                        // creeps 0.4 mm/frame = 2.4 mm
+            var creep = contact(0.80 + Float(i) * 0.004, 0.5, path: 3)
+            creep.zTotal = 3.0
+            feed([creep], at: Double(i) * 0.02)                 // streak crosses 1.5 mm → moving
+        }
+        var stopped = contact(0.824, 0.5, path: 3)              // stops dead
+        stopped.zTotal = 3.0
+        for i in 0..<10 {                                       // window rolls → healed
+            feed([stopped], at: 0.14 + Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.40) + [stopped], at: 0.40)
+        feed(threeFingers(centerX: 0.40) + [stopped], at: 0.44)
+        feed([], at: 0.48)
+        // its 2.4 mm total travel is also under the tap's 4 mm bar — clean click
+        XCTAssertEqual(actions, [.middleClick])
+    }
+
+    /// The other half of "settled is measured in mm": a contact creeping inside the
+    /// band must NEVER earn the parked latch, however many sub-eps frames it racks
+    /// up — streak displacement, not frame count, is the settlement proof. When it
+    /// is still creeping as three fingers land, it is a straggler and the gesture dies.
+    func testCreepingBandContactNeverEarnsPark() {
+        for i in 0..<12 {                                       // creeps 0.4 mm/frame inside the band
+            feed([contact(0.02 + Float(i) * 0.004, 0.5, path: 3)], at: Double(i) * 0.02)
+        }
+        feed(threeFingers(centerX: 0.45) + [contact(0.064, 0.5, path: 3)], at: 0.30)
+        feed(threeFingers(centerX: 0.45) + [contact(0.064, 0.5, path: 3)], at: 0.34)
+        feed([], at: 0.38)
+        // never parked → during .tracking it's an unfiltered fourth contact → no tap
+        XCTAssertEqual(actions, [])
+    }
+
+    /// The evidence latch must hold through EVERY window, not just trip frames:
+    /// a 0.1 mm/frame creep crosses the 0.75 mm window bound once per window —
+    /// a per-frame `moving` reading would hand it multi-frame amnesty windows
+    /// between trips. The fingers land mid-window (stillFrames≈5, streak≈0.5):
+    /// per-frame semantics reads it still and lets the phantom fire; the latch
+    /// keeps it quarantined.
+    func testVerySlowCreepStaysQuarantined() {
+        for i in 0..<37 {                                       // creeps 0.1 mm/frame
+            var creep = contact(0.80 + Float(i) * 0.001, 0.5, path: 3)
+            creep.zTotal = 3.0
+            feed([creep], at: Double(i) * 0.02)
+        }
+        // lands mid-window: latch up, streak under the bound on this frame
+        var held = contact(0.837, 0.5, path: 3)
+        held.zTotal = 3.0
+        feed(threeFingers(centerX: 0.40) + [held], at: 0.76)
+        feed(threeFingers(centerX: 0.56) + [held], at: 0.78)     // crosses → entry held
+        feed(threeFingers(centerX: 0.56) + [held], at: 0.82)     // confirm frame — streak still 0.7
+        feed([], at: 0.86)
+        XCTAssertEqual(actions, [])
+    }
+
+    /// Un-parking must burn the stillness credit too: a thumb that creeps past the
+    /// 4 mm bound is a finger again and re-earns only through a fresh clean
+    /// window — it can't spend stillness accumulated while drifting. The contact
+    /// is oversized so it stays palm-filtered even in .tracking — only the
+    /// evidence latch can expose it (a normal-size one would count regardless).
+    func testUnparkedThumbMustReProveStillness() {
+        var thumb = contact(0.02, 0.5, path: 3)
+        thumb.zTotal = 3.0
+        for i in 0..<10 { feed([thumb], at: Double(i) * 0.02) }   // settles → parked
+        for i in 1...14 {                                        // creeps 0.3 mm/frame ≈ 4.2 mm
+            var creep = contact(0.02 + Float(i) * 0.003, 0.5, path: 3)
+            creep.zTotal = 3.0
+            feed([creep], at: 0.20 + Double(i) * 0.02)           // travel >4 mm → un-parks mid-creep
+        }
+        var settled = contact(0.062, 0.5, path: 3)
+        settled.zTotal = 3.0
+        feed([settled], at: 0.50)                                // stops — only 2 still frames
+        feed([settled], at: 0.52)
+        feed(threeFingers(centerX: 0.45) + [settled], at: 0.54)
+        feed(threeFingers(centerX: 0.61) + [settled], at: 0.56)  // crosses → entry held
+        feed(threeFingers(centerX: 0.61) + [settled], at: 0.60)  // confirm frame — latch must block it
+        feed([], at: 0.64)
         XCTAssertEqual(actions, [])
     }
 }

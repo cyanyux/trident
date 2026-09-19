@@ -46,6 +46,28 @@ private nonisolated(unsafe) var gTap: CFMachPort?
 /// is not mid-gesture (e.g. in Settings revoking Accessibility) there is NO active tap in
 /// the system-wide input path that could wedge the WindowServer. Guarded by `gSuppressLock`.
 private nonisolated(unsafe) var gTapEnabled = false
+/// Epoch gate for the suppression setters. `stop()` clears this under `gSuppressLock`
+/// BEFORE invalidating the tap; a touch frame already past the monitor's enabled check
+/// can still be mid-flight at that point and would otherwise re-set `gClickActive` /
+/// `gCursorFreeze` AFTER the teardown cleared them — a poisoned flag that would turn the
+/// next gesture's tap permanently on and eat clicks/cursor moves system-wide. While this
+/// is false, the setters' `true` directions are no-ops. Set in `start()`, cleared in
+/// `stop()`. Guarded by `gSuppressLock`.
+private nonisolated(unsafe) var gSuppressionEpochOpen = false
+
+/// Serializes every `CGEvent.tapEnable`/`CFMachPortInvalidate` issued AFTER the tap
+/// is published — gesture-driven enables, the idle disable, teardown, and the
+/// callback's post-timeout re-enable — onto one serial queue. (The one exception is
+/// `start()`'s initial disable, which runs before `gTap` is published and so can
+/// race nothing.) FIFO ordering is what keeps an enable from landing on a
+/// just-invalidated port (the dead-port crash class DeviceMonitor's retain comment
+/// describes): invalidate runs only here, so an enable block either runs before it
+/// (live port) or reads the `gTap = nil` teardown left behind and skips. The CG
+/// calls themselves run OUTSIDE `gSuppressLock` inside each block — a lock-held CG
+/// call could stall the tap callback (which needs the lock per delivered event) and
+/// the WindowServer behind it for the call's duration. Global, like the state it
+/// guards, because the `@convention(c)` callback needs to reach it.
+private let gControlQueue = DispatchQueue(label: "com.trident.suppressor.control")
 
 /// Frame-gap beyond which a still-"active" gesture is assumed dead and self-cleared.
 private let gStaleGap = GestureTuning.staleStreamGap
@@ -59,6 +81,12 @@ private nonisolated(unsafe) var gLastTimeoutReenable: CFTimeInterval = 0
 /// WindowServer re-enable fight that caused the original reboot-level freeze.
 private let gTimeoutRefightWindow: CFTimeInterval = 0.5
 
+/// Invoked when the system force-disables the tap on user-input grounds — the shape an
+/// Accessibility REVOKE takes while a gesture is live. Set at `start()`, cleared at
+/// `stop()`, read under `gSuppressLock` and invoked AFTER unlocking it (the handler hops
+/// to main itself). Lets the app reprobe instantly instead of waiting out the slow poll.
+private nonisolated(unsafe) var gOnTapForceDisabled: (() -> Void)?
+
 /// Drop the "active suppression" pair. CALLER MUST HOLD `gSuppressLock`. Single-sources the reset the
 /// two self-heal sites (the callback below + `tick()`) and `stop()` all perform when a gesture is done
 /// or its stream died — a stale field here is exactly how suppression wedges, so keeping the set in one
@@ -66,6 +94,19 @@ private let gTimeoutRefightWindow: CFTimeInterval = 0.5
 private func clearActiveSuppressionLocked() {
     gClickActive = false
     gCursorFreeze = false
+}
+
+/// Re-enable the tap after a `.tapDisabledByTimeout`, hopped here by the tap callback.
+/// Runs on `gControlQueue` so the call is FIFO-ordered against `stop()`'s invalidate —
+/// `tapEnable` on a port invalidated mid-flight is the dead-port crash class. Skips if
+/// teardown already ran (`gTap == nil`) or a newer event already decided against the
+/// enable (`gTapEnabled == false`).
+private func reenableTapIfLive() {
+    os_unfair_lock_lock(&gSuppressLock)
+    let tap = gTap
+    let wanted = gTapEnabled
+    os_unfair_lock_unlock(&gSuppressLock)
+    if wanted, let tap { CGEvent.tapEnable(tap: tap, enable: true) }
 }
 
 private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
@@ -77,8 +118,19 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
         // original reboot-level freeze bug). Just sync our flag to reality; the next gesture's
         // `enableTap()` brings it back if permission returns.
         os_unfair_lock_lock(&gSuppressLock)
+        // `gTapEnabled == true` means the tap died while we still wanted it on — a
+        // REAL external force-disable (a revoke). `false` means the event is our own
+        // `tapEnable(false)` echoing back (tick()'s idle disable and stop() both clear
+        // the flag before calling): swallow it silently, or every gesture end would
+        // fire a reprobe. (A stale self-echo that outlives the NEXT gesture's
+        // re-enable can still read `true` — cost is one inert probe, acceptable.)
+        let forced = gTapEnabled
         gTapEnabled = false
+        let onForceDisabled = forced ? gOnTapForceDisabled : nil
         os_unfair_lock_unlock(&gSuppressLock)
+        // A real force-disable IS the revoke signal — tell the app to reprobe now
+        // rather than discovering it on the next poll tick. The handler hops to main.
+        onForceDisabled?()
         return Unmanaged.passUnretained(event)
     }
     if type == .tapDisabledByTimeout {
@@ -108,9 +160,13 @@ private let eventTapCallback: CGEventTapCallBack = { _, type, event, _ in
         let willReenable = stillNeeded && !refighting
         gTapEnabled = willReenable
         if willReenable { gLastTimeoutReenable = now }
-        let tap = gTap
         os_unfair_lock_unlock(&gSuppressLock)
-        if willReenable, let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+        // The re-enable is hopped onto the control queue rather than called here:
+        // every tapEnable serializes there so one can never land on a port stop() is
+        // invalidating — and no CoreGraphics call runs on THIS thread, where the
+        // WindowServer blocks behind the callback (RULE D), or under gSuppressLock,
+        // where a congested CG call could stall every delivered event.
+        if willReenable { gControlQueue.async { reenableTapIfLive() } }
         return Unmanaged.passUnretained(event)
     }
 
@@ -212,14 +268,17 @@ final class GestureEventSuppressor: @unchecked Sendable {
     private var tapThread: Thread?
     private var tapRunLoop: CFRunLoop?
 
-    /// Serializes every `CGEvent.tapEnable` call (gesture-driven enable + idle-driven
-    /// disable) onto one queue, so the tap's enabled state can never be raced. Also hosts
-    /// the control timer.
-    private let controlQueue = DispatchQueue(label: "com.trident.suppressor.control")
     /// Armed only while a gesture (or its tail) is active: it disables the tap once idle and
     /// self-heals a dead gesture, then stops itself. So a quiescent Trident has ZERO periodic
-    /// wakeups — the timer exists only for the sub-second life of a gesture.
+    /// wakeups — the timer exists only for the sub-second life of a gesture. Runs on the
+    /// global `gControlQueue` that serializes every CG call (see its comment).
     private var controlTimer: DispatchSourceTimer?
+
+    /// Called on the tap's run-loop thread when the system force-disables the tap on
+    /// user-input grounds — i.e., an Accessibility revoke landing while a gesture is
+    /// live. The app layer uses it to reprobe immediately rather than discovering the
+    /// dead engine on the next poll tick. Set before `start()`; read once per start.
+    var onTapForceDisabled: (() -> Void)?
 
     deinit { stop() }
 
@@ -265,6 +324,8 @@ final class GestureEventSuppressor: @unchecked Sendable {
         os_unfair_lock_lock(&gSuppressLock)
         gTap = tap
         gTapEnabled = false
+        gSuppressionEpochOpen = true   // open the gate: suppression setters take effect
+        gOnTapForceDisabled = onTapForceDisabled
         os_unfair_lock_unlock(&gSuppressLock)
 
         // The semaphore makes start() return only once the run loop is live, so a later
@@ -295,20 +356,32 @@ final class GestureEventSuppressor: @unchecked Sendable {
     /// Remove the tap, stop its thread and idle timer, and clear any pending suppression.
     /// Main thread.
     func stop() {
-        controlQueue.sync { disarmControlTimer() }
+        gControlQueue.sync { disarmControlTimer() }
 
         os_unfair_lock_lock(&gSuppressLock)
+        // Close the epoch FIRST: a touch frame already past the monitor's enabled check
+        // can still be mid-flight right now — after this, its `setGestureActive(true)` /
+        // `setCursorFreeze(true)` calls are no-ops and can't re-poison the cleared state.
+        gSuppressionEpochOpen = false
         clearActiveSuppressionLocked()
         gWasSwipe = false
         gSuppressLeftUntil = 0
         gSuppressRightUntil = 0
         gTapEnabled = false
         gTap = nil
+        gOnTapForceDisabled = nil
         os_unfair_lock_unlock(&gSuppressLock)
 
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-            CFMachPortInvalidate(tap)   // drop it from the WindowServer's event chain
+        // Disable + invalidate on the control queue so they serialize AFTER any
+        // tapEnable already queued there (an enable racing an invalidate hits a dead
+        // port — the queue's FIFO order is the guarantee). The CG calls run outside
+        // gSuppressLock: a lock-held CG call could stall the tap callback — and the
+        // WindowServer blocked behind it — for the call's duration.
+        gControlQueue.sync {
+            if let tap {
+                CGEvent.tapEnable(tap: tap, enable: false)
+                CFMachPortInvalidate(tap)   // drop it from the WindowServer's event chain
+            }
         }
         if let source = runLoopSource, let runLoop = tapRunLoop {
             CFRunLoopRemoveSource(runLoop, source, .commonModes)
@@ -337,10 +410,19 @@ final class GestureEventSuppressor: @unchecked Sendable {
     /// Drives click suppression. Thread-safe.
     func setGestureActive(_ active: Bool) {
         os_unfair_lock_lock(&gSuppressLock)
+        // The epoch gate: while stopped, a `true` is a no-op — a frame in flight across
+        // teardown must not re-arm suppression after stop() cleared it. `false` always
+        // lands (it only ever disarms).
+        if active, !gSuppressionEpochOpen {
+            os_unfair_lock_unlock(&gSuppressLock)
+            return
+        }
         gClickActive = active
         if active {
             gWasSwipe = false   // a fresh gesture starts tap-like; setCursorFreeze marks a swipe
-        } else {
+        } else if gSuppressionEpochOpen {
+            // Arm the tails only while running: a stale `false` from a frame still in
+            // flight across stop() must not re-arm deadlines stop() just zeroed.
             let now = CACurrentMediaTime()
             // Swipes get a much shorter tail than tap-like gestures (see gWasSwipe).
             gSuppressLeftUntil = now + (gWasSwipe ? swipeTail : tail)
@@ -354,6 +436,10 @@ final class GestureEventSuppressor: @unchecked Sendable {
     /// while the swipe holds the ⌘Tab HUD (see the callback). Touches no CoreGraphics. Thread-safe.
     func setCursorFreeze(_ active: Bool) {
         os_unfair_lock_lock(&gSuppressLock)
+        if active, !gSuppressionEpochOpen {
+            os_unfair_lock_unlock(&gSuppressLock)
+            return
+        }
         gCursorFreeze = active
         if active {
             gWasSwipe = true      // this gesture swiped → short tail at gesture end
@@ -362,41 +448,47 @@ final class GestureEventSuppressor: @unchecked Sendable {
         if active { enableTap() }
     }
 
-    // MARK: - Tap enable/disable + control timer (serialized on controlQueue)
+    // MARK: - Tap enable/disable + control timer (serialized on gControlQueue)
 
     /// Enable the tap if it isn't already, and arm the control timer for the gesture's
     /// lifetime. Called from the framework callback thread at gesture start; the work is
-    /// hopped onto `controlQueue` so the `tapEnable` never races the timer's disable. A
+    /// hopped onto `gControlQueue` so the `tapEnable` never races the timer's disable. A
     /// gesture is detected well before any synthesized click, so the enable lands in time.
     private func enableTap() {
-        controlQueue.async { [weak self] in
+        gControlQueue.async { [weak self] in
             os_unfair_lock_lock(&gSuppressLock)
             let tap = gTap
             let was = gTapEnabled
-            gTapEnabled = true
+            if tap != nil { gTapEnabled = true }
             os_unfair_lock_unlock(&gSuppressLock)
-            if !was, let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            // Post-stop (gTap already nil'd): skip the timer too — a resurrected
+            // control timer on a dead suppressor is harmless but pointless.
+            guard let tap else { return }
+            // Outside the lock, like every CG call: the serial queue already orders
+            // this against stop()'s invalidate, and a lock-held call could stall the
+            // tap callback — and the WindowServer behind it — for the call's duration.
+            if !was { CGEvent.tapEnable(tap: tap, enable: true) }
             self?.armControlTimer()
         }
     }
 
-    /// Start the control timer if it isn't already running. `controlQueue` only.
+    /// Start the control timer if it isn't already running. `gControlQueue` only.
     private func armControlTimer() {
         guard controlTimer == nil else { return }
-        let timer = DispatchSource.makeTimerSource(queue: controlQueue)
+        let timer = DispatchSource.makeTimerSource(queue: gControlQueue)
         timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
         timer.setEventHandler { [weak self] in self?.tick() }
         controlTimer = timer
         timer.resume()
     }
 
-    /// Stop the control timer. `controlQueue` only.
+    /// Stop the control timer. `gControlQueue` only.
     private func disarmControlTimer() {
         controlTimer?.cancel()
         controlTimer = nil
     }
 
-    /// Control-timer tick (`controlQueue`): self-heal a dead gesture, then — once nothing
+    /// Control-timer tick (`gControlQueue`): self-heal a dead gesture, then — once nothing
     /// needs suppression — disable the tap (out of the system-wide input path) and stop the
     /// timer until the next gesture re-arms it.
     private func tick() {
@@ -407,11 +499,16 @@ final class GestureEventSuppressor: @unchecked Sendable {
         }
         let needed = gClickActive || gCursorFreeze || now < gSuppressLeftUntil || now < gSuppressRightUntil
         let tap = gTap
-        let was = gTapEnabled
         if !needed { gTapEnabled = false }
         os_unfair_lock_unlock(&gSuppressLock)
+        // The disable runs outside the lock, on this serial queue — same ordering
+        // guarantee as enableTap() against stop()'s invalidate. Sent UNCONDITIONALLY
+        // (idempotent on a disabled port): gating it on the pre-call flag diverges
+        // if .tapDisabledByUserInput cleared the flag while an enable was still
+        // queued — the port would end up enabled with the flag reading false, and
+        // no later tick would ever switch it off.
+        if !needed, let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         guard !needed else { return }    // still active — keep ticking
-        if was, let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         disarmControlTimer()             // idle — stop waking until the next gesture
     }
 }

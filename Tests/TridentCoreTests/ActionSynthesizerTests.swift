@@ -245,6 +245,83 @@ final class ActionSynthesizerTests: XCTestCase {
         XCTAssertEqual(keyCount(kEscape, down: true), 0, "completing a commit must not Escape")
         XCTAssertFalse(synth.commandHeldForTesting)
     }
+
+    // MARK: - Maybe-stuck ⌘ recovery (notePermissionLost)
+    //
+    // A release posted under a TCC revoke reports success but never delivers —
+    // `commandHeld` clears while the physical ⌘ stays down. `notePermissionLost()`
+    // latches that possibility, and the next `prepare()` re-posts the finishers.
+
+    /// The `.committing` variant re-posts the ⌘-up only — never an Escape that would
+    /// un-commit a switch the user already made.
+    func testPrepareReleasesMaybeStuckCommit() {
+        send(.swipeBegin)
+        send(.swipeCommit)                       // release "posts" — dropped in transit
+        XCTAssertFalse(synth.commandHeldForTesting)
+        synth.notePermissionLost()
+        synth.drainForTesting()
+        synth.releaseAllAndWait()                // teardown — nothing held, nothing posts
+
+        sink.reset()
+        synth.prepare()
+        synth.drainForTesting()
+
+        XCTAssertGreaterThanOrEqual(keyCount(kCommand, down: false), 1,
+                                   "a maybe-stuck ⌘-up is re-posted on the next start")
+        XCTAssertEqual(keyCount(kEscape, down: true), 0,
+                       "a committed switch must not be un-committed")
+        XCTAssertFalse(synth.commandHeldForTesting)
+    }
+
+    /// The in-progress variant re-dismisses too: the teardown Escape may also have
+    /// been dropped, so prepare() re-posts it before the ⌘-up.
+    func testPrepareReleasesMaybeStuckInProgress() {
+        send(.swipeBegin)
+        synth.notePermissionLost()
+        synth.drainForTesting()
+        sink.reset()
+        synth.releaseAllAndWait()                // resolves .inProgress → Escape + ⌘-up ("dropped")
+        sink.reset()
+        synth.prepare()
+        synth.drainForTesting()
+        XCTAssertEqual(keyCount(kEscape, down: true), 1, "the possibly-dropped dismiss is re-posted")
+        XCTAssertGreaterThanOrEqual(keyCount(kCommand, down: false), 1)
+    }
+
+    /// No latch when nothing was pressed — a run of pure middle clicks must not make
+    /// the next start clobber a ⌘ the user may physically hold.
+    func testNotePermissionLostWithoutPressDoesNotRecover() {
+        send(.middleClick)
+        synth.notePermissionLost()
+        synth.drainForTesting()
+        synth.releaseAllAndWait()
+        sink.reset()
+        synth.prepare()
+        synth.drainForTesting()
+        XCTAssertEqual(sink.keys.count, 0)
+    }
+
+    // MARK: - onCommandReleased settle callback
+
+    /// A commit settles once the ⌘-up posts — the engine hooks this to lift the
+    /// cursor freeze strictly after the release, so a still-drawing HUD can't read
+    /// the cursor and hijack the selection.
+    func testCommitFiresOnCommandReleased() {
+        var settled = 0
+        synth.onCommandReleased = { settled += 1 }
+        send(.swipeBegin)
+        send(.swipeCommit)
+        XCTAssertEqual(settled, 1)
+    }
+
+    /// A terminal action with nothing held still settles — the unfreeze can't wait
+    /// on a release that will never run.
+    func testStrayCommitWithoutHeldStillSettles() {
+        var settled = 0
+        synth.onCommandReleased = { settled += 1 }
+        send(.swipeCommit)
+        XCTAssertEqual(settled, 1)
+    }
 }
 
 // MARK: - Test double
