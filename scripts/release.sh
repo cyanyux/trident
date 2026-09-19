@@ -79,8 +79,11 @@ fi
 # Releasing an ad-hoc-signed build is unrecoverable for users: the signature changes
 # every build, orphaning every install's Accessibility grant and login-item
 # registration. build.sh only warns and falls back — so the stable identity (cert
-# AND a usable private key, which find-identity -v requires) is a hard gate here.
-if ! security find-identity -v -p codesigning | grep -q '"Trident Dev"'; then
+# AND a usable private key — which is what "Matching identities" lists) is a hard
+# gate here. NOT `-v`: that flag drops identities lacking a trust setting, and a
+# self-signed cert is never trusted — yet codesign signs with it fine, and TCC's
+# designated requirement (which is what preserves the grant) doesn't care either.
+if ! security find-identity -p codesigning | grep -q '"Trident Dev"'; then
   echo "error: 'Trident Dev' signing identity (cert + key) not found —" >&2
   echo "       run ./scripts/setup-signing.sh first." >&2
   exit 1
